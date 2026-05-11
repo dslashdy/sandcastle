@@ -18,7 +18,7 @@ import {
   type SandboxService,
 } from "./SandboxFactory.js";
 
-const GIT_SETUP_TIMEOUT_MS = 10_000;
+const GIT_SETUP_TIMEOUT_MS = 30_000;
 const HOOK_TIMEOUT_MS = 60_000;
 const COMMIT_COLLECTION_TIMEOUT_MS = 30_000;
 const MERGE_TO_HOST_TIMEOUT_MS = 30_000;

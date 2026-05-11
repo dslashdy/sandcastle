@@ -22,6 +22,10 @@
       "import": "./dist/sandboxes/podman.js",
       "types": "./dist/sandboxes/podman.d.ts"
     },
+    "./sandboxes/sbx": {
+      "import": "./dist/sandboxes/sbx.js",
+      "types": "./dist/sandboxes/sbx.d.ts"
+    },
     "./sandboxes/daytona": {
       "import": "./dist/sandboxes/daytona.js",
       "types": "./dist/sandboxes/daytona.d.ts"
@@ -45,6 +49,7 @@
     "prepare": "husky",
     "release": "changeset publish",
     "sandcastle": "npm run build && tsx .sandcastle/run.ts",
+    "test-sbx-claude": "npm run build && tsx .sandcastle/test-sbx-claude.ts",
     "test-podman": "npm run build && tsx --env-file=.sandcastle/.env .sandcastle/test-podman.ts",
     "test-vercel": "npm run build && tsx --env-file=.sandcastle/.env .sandcastle/test-vercel.ts",
     "test-interactive": "npm run build && tsx --env-file=.sandcastle/.env .sandcastle/test-interactive.ts"
@@ -64,6 +69,7 @@
   "license": "MIT",
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
+    "@daytona/sdk": "^0.164.0",
     "@effect/vitest": "^0.28.0",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "^7.0.0-dev.20260317.1",
