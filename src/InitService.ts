@@ -326,6 +326,8 @@ export interface SandboxProviderEntry {
   readonly requiresImageBuild: boolean;
   /** Whether Docker builds for this provider should align the image user to the host UID/GID. */
   readonly useHostUidBuildArgs?: boolean;
+  /** Whether Docker builds for this provider should also be loaded into SBX's template store. */
+  readonly loadIntoSbxTemplateStore?: boolean;
   /** When set, only these agent names can be used with this sandbox provider. */
   readonly supportedAgentNames?: readonly string[];
   /** Provider factory expression to write in scaffolded templates. */
@@ -360,6 +362,7 @@ const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
     containerfileName: "Dockerfile",
     cliNamespace: "docker",
     requiresImageBuild: true,
+    loadIntoSbxTemplateStore: true,
     factoryCall: (agent, imageName) => {
       const sbxAgent = agent.name === "claude-code" ? "claude" : agent.name;
       return `sbx({ agent: "${sbxAgent}", template: ${JSON.stringify(imageName)} })`;

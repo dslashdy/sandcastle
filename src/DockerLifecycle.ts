@@ -1,6 +1,8 @@
 import { Effect } from "effect";
 import { execFile } from "node:child_process";
-import { resolve } from "node:path";
+import { rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { DockerError } from "./errors.js";
 import { formatVolumeMount, type SelinuxLabel } from "./mountUtils.js";
 
@@ -64,6 +66,43 @@ export const buildImage = (
         resolve(dockerfileDir),
       ]);
     }
+  });
+
+/**
+ * Load a local Docker image into SBX's template image store.
+ *
+ * SBX resolves `--template` from its own image store. A freshly built local
+ * Docker image is not visible to SBX until it is exported and loaded.
+ */
+export const loadImageIntoSbxTemplateStore = (
+  imageName: string,
+): Effect.Effect<void, DockerError> =>
+  Effect.gen(function* () {
+    const safeName = imageName.replace(/[^a-zA-Z0-9_.-]/g, "-");
+    const tarPath = join(tmpdir(), `${safeName}-${Date.now()}.tar`);
+
+    yield* dockerExec(["save", imageName, "-o", tarPath]);
+    yield* Effect.async<void, DockerError>((resume) => {
+      execFile(
+        "sbx",
+        ["template", "load", tarPath],
+        { maxBuffer: 10 * 1024 * 1024 },
+        (error, _stdout, stderr) => {
+          if (error) {
+            resume(
+              Effect.fail(
+                new DockerError({
+                  message: `sbx template load failed: ${stderr?.toString() || error.message}`,
+                }),
+              ),
+            );
+          } else {
+            resume(Effect.succeed(undefined));
+          }
+        },
+      );
+    });
+    yield* Effect.ignore(Effect.promise(() => rm(tarPath, { force: true })));
   });
 
 export interface VolumeMount {

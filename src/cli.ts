@@ -8,7 +8,11 @@ import { join } from "node:path";
 import { styleText } from "node:util";
 
 import { Display } from "./Display.js";
-import { buildImage, removeImage } from "./DockerLifecycle.js";
+import {
+  buildImage,
+  loadImageIntoSbxTemplateStore,
+  removeImage,
+} from "./DockerLifecycle.js";
 import {
   buildImage as podmanBuildImage,
   removeImage as podmanRemoveImage,
@@ -351,6 +355,12 @@ const initCommand = Command.make(
                   : undefined,
               }),
             );
+            if (selectedSandboxProvider.loadIntoSbxTemplateStore) {
+              yield* d.spinner(
+                `Loading ${providerLabel} template '${imageName}'...`,
+                loadImageIntoSbxTemplateStore(imageName),
+              );
+            }
           }
           yield* d.status(
             "Init complete! Image built successfully.",

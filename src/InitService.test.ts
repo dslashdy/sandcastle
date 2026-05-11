@@ -2075,6 +2075,7 @@ describe("Sandbox provider registry", () => {
     expect(provider!.cliNamespace).toBe("docker");
     expect(provider!.requiresImageBuild).toBe(true);
     expect(provider!.useHostUidBuildArgs).toBeUndefined();
+    expect(provider!.loadIntoSbxTemplateStore).toBe(true);
     expect(provider!.supportedAgentNames).toEqual(["claude-code", "codex"]);
   });
 
