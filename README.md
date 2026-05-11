@@ -104,6 +104,8 @@ await interactive({
 
 The SBX provider uses `sbx create shell` by default and direct same-path workspace mounts. Pass `sbx({ agent: "claude" })` to create SBX's Claude Code sandbox instead, which is useful for Claude Max subscription auth. Extra `workspaces` are also mounted at the same absolute path inside the sandbox, so use Docker or Podman if you need to remap `{ hostPath, sandboxPath }`.
 
+For Codex, interactive SBX auth and non-interactive `codex exec --json` auth can behave differently. Use `sbx({ agent: "codex" })` with `codex(..., { env: { OPENAI_API_KEY } })` for automated runs and smoke tests. The repo's `npm run test-sbx-codex` script follows that pattern and fails early when `OPENAI_API_KEY` is not set.
+
 You can also [create your own provider](#custom-sandbox-providers) using `createBindMountSandboxProvider` or `createIsolatedSandboxProvider`.
 
 ## API
