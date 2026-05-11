@@ -2,6 +2,7 @@ import { FileSystem } from "@effect/platform";
 import { Effect } from "effect";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultImageName } from "./mountUtils.js";
 import { SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 
 const GITIGNORE = `.env
@@ -326,7 +327,7 @@ export interface SandboxProviderEntry {
   /** When set, only these agent names can be used with this sandbox provider. */
   readonly supportedAgentNames?: readonly string[];
   /** Provider factory expression to write in scaffolded templates. */
-  readonly factoryCall: (agent: AgentEntry) => string;
+  readonly factoryCall: (agent: AgentEntry, imageName: string) => string;
 }
 
 const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
@@ -352,11 +353,13 @@ const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
     name: "sbx",
     label: "SBX",
     factoryImport: "sbx",
-    requiresImageBuild: false,
     supportedAgentNames: ["claude-code", "codex"],
-    factoryCall: (agent) => {
+    containerfileName: "Dockerfile",
+    cliNamespace: "docker",
+    requiresImageBuild: true,
+    factoryCall: (agent, imageName) => {
       const sbxAgent = agent.name === "claude-code" ? "claude" : agent.name;
-      return `sbx({ agent: "${sbxAgent}" })`;
+      return `sbx({ agent: "${sbxAgent}", template: ${JSON.stringify(imageName)} })`;
     },
   },
 ];
@@ -546,6 +549,7 @@ const rewriteSandboxProvider = (
   configDir: string,
   sandboxProvider: SandboxProviderEntry,
   agent: AgentEntry,
+  imageName: string,
   mainFilename: string,
 ): Effect.Effect<void, Error, FileSystem.FileSystem> =>
   Effect.gen(function* () {
@@ -567,7 +571,7 @@ const rewriteSandboxProvider = (
     );
     content = content.replace(
       /\bsandbox:\s*docker\(\)/g,
-      `sandbox: ${sandboxProvider.factoryCall(agent)}`,
+      `sandbox: ${sandboxProvider.factoryCall(agent, imageName)}`,
     );
     content = content.replace(
       /Docker is the default runtime/g,
@@ -685,6 +689,7 @@ export interface ScaffoldOptions {
   createLabel?: boolean;
   backlogManager?: BacklogManagerEntry;
   sandboxProvider?: SandboxProviderEntry;
+  imageName?: string;
 }
 
 export interface ScaffoldResult {
@@ -728,6 +733,7 @@ export const scaffold = (
       createLabel = true,
       backlogManager = BACKLOG_MANAGER_REGISTRY[0]!, // default: github-issues
       sandboxProvider = SANDBOX_PROVIDER_REGISTRY[0]!, // default: docker
+      imageName = defaultImageName(repoDir),
     } = options;
     const fs = yield* FileSystem.FileSystem;
     const configDir = join(repoDir, ".sandcastle");
@@ -795,6 +801,7 @@ export const scaffold = (
       configDir,
       sandboxProvider,
       agent,
+      imageName,
       mainFilename,
     );
 

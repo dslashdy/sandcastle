@@ -1965,14 +1965,14 @@ describe("InitService scaffold", () => {
       ).rejects.toThrow();
     });
 
-    it("selecting sbx for claude-code writes no containerfile and uses the claude runtime", async () => {
+    it("selecting sbx for claude-code writes Dockerfile and uses the claude runtime template", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { sandboxProvider: sbxProvider });
 
       const { access } = await import("node:fs/promises");
       await expect(
         access(join(dir, ".sandcastle", "Dockerfile")),
-      ).rejects.toThrow();
+      ).resolves.toBeUndefined();
       await expect(
         access(join(dir, ".sandcastle", "Containerfile")),
       ).rejects.toThrow();
@@ -1984,7 +1984,9 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain(
         'import { sbx } from "@ai-hero/sandcastle/sandboxes/sbx"',
       );
-      expect(mainTs).toContain('sandbox: sbx({ agent: "claude" })');
+      expect(mainTs).toContain(
+        'sandbox: sbx({ agent: "claude", template: "sandcastle:init-service-',
+      );
       expect(mainTs).not.toContain("sandboxes/docker");
       expect(mainTs).not.toContain("sandbox: docker()");
     });
@@ -2002,7 +2004,25 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(mainTs).toContain('codex("gpt-5.4-mini")');
-      expect(mainTs).toContain('sandbox: sbx({ agent: "codex" })');
+      expect(mainTs).toContain(
+        'sandbox: sbx({ agent: "codex", template: "sandcastle:init-service-',
+      );
+    });
+
+    it("selecting sbx uses the configured image name as the template", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        sandboxProvider: sbxProvider,
+        imageName: "sandcastle:custom-sbx",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        'sandbox: sbx({ agent: "claude", template: "sandcastle:custom-sbx" })',
+      );
     });
 
     it("rejects sbx for unsupported agents", async () => {
@@ -2050,9 +2070,9 @@ describe("Sandbox provider registry", () => {
   it("getSandboxProvider returns sbx entry", () => {
     const provider = getSandboxProvider("sbx");
     expect(provider).toBeDefined();
-    expect(provider!.containerfileName).toBeUndefined();
-    expect(provider!.cliNamespace).toBeUndefined();
-    expect(provider!.requiresImageBuild).toBe(false);
+    expect(provider!.containerfileName).toBe("Dockerfile");
+    expect(provider!.cliNamespace).toBe("docker");
+    expect(provider!.requiresImageBuild).toBe(true);
     expect(provider!.supportedAgentNames).toEqual(["claude-code", "codex"]);
   });
 

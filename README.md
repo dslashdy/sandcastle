@@ -660,7 +660,7 @@ Scaffolds the `.sandcastle/` config directory and builds the container image whe
 
 - Docker writes a `Dockerfile` and uses `sandcastle docker build-image`.
 - Podman writes a `Containerfile` and uses `sandcastle podman build-image`.
-- SBX writes no containerfile and skips image build because it uses SBX's prebuilt runtimes. SBX init is agent-aware and currently supports `claude-code` via `sbx({ agent: "claude" })` and `codex` via `sbx({ agent: "codex" })`.
+- SBX writes a `Dockerfile`, builds it with Docker, and uses that image as the SBX template. SBX init is agent-aware and currently supports `claude-code` via `sbx({ agent: "claude", template: "sandcastle:<repo>" })` and `codex` via `sbx({ agent: "codex", template: "sandcastle:<repo>" })`.
 
 | Option         | Required | Default                      | Description                                                          |
 | -------------- | -------- | ---------------------------- | -------------------------------------------------------------------- |
@@ -670,11 +670,11 @@ Scaffolds the `.sandcastle/` config directory and builds the container image whe
 | `--template`   | No       | Interactive prompt           | Template to scaffold (e.g. `blank`, `simple-loop`)                   |
 | `--sandbox`    | No       | Interactive prompt           | Sandbox provider to use (`docker`, `podman`, `sbx`)                  |
 
-Creates the following files. Docker creates `Dockerfile`, Podman creates `Containerfile`, and SBX omits the containerfile because it uses prebuilt runtimes.
+Creates the following files. Docker and SBX create `Dockerfile`; Podman creates `Containerfile`.
 
 ```
 .sandcastle/
-├── Dockerfile      # Docker only; Containerfile for Podman; omitted for SBX
+├── Dockerfile      # Docker/SBX; Containerfile for Podman
 ├── prompt.md       # Agent instructions
 ├── .env.example    # Token placeholders
 └── .gitignore      # Ignores .env, logs/

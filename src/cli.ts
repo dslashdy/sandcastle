@@ -314,6 +314,7 @@ const initCommand = Command.make(
           createLabel: shouldCreateLabel === true,
           backlogManager: selectedBacklogManager,
           sandboxProvider: selectedSandboxProvider,
+          imageName,
         }).pipe(
           Effect.mapError(
             (e) =>
