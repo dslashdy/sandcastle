@@ -128,6 +128,8 @@ describe("sandcastle CLI", () => {
     expect(stdout).toContain("podman");
     expect(stdout).toContain("podman build-image");
     expect(stdout).toContain("podman remove-image");
+    expect(stdout).toContain("sbx");
+    expect(stdout).toContain("sbx build-template");
   });
 
   it("podman --help shows build-image and remove-image subcommands", async () => {
@@ -149,6 +151,32 @@ describe("sandcastle CLI", () => {
 
     try {
       await runCli("podman build-image", hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("No .sandcastle/ found");
+    }
+  });
+
+  it("sbx --help shows build-template subcommand", async () => {
+    const { stdout } = await runCli("sbx --help", process.cwd());
+    expect(stdout).toContain("build-template");
+  });
+
+  it("sbx build-template --help shows --dockerfile and --image-name flags", async () => {
+    const { stdout } = await runCli("sbx build-template --help", process.cwd());
+    expect(stdout).toContain("--dockerfile");
+    expect(stdout).toContain("--image-name");
+  });
+
+  it("sbx build-template errors when .sandcastle/ is missing", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    try {
+      await runCli("sbx build-template", hostDir);
       expect.fail("Expected command to fail");
     } catch (err: unknown) {
       const { stdout, stderr } = err as { stdout: string; stderr: string };

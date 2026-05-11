@@ -708,6 +708,15 @@ Builds the Podman image from an existing `.sandcastle/` directory. Use this afte
 | `--image-name`    | No       | `sandcastle:<repo-dir-name>` | Podman image name                                                                    |
 | `--containerfile` | No       | —                            | Path to a custom Containerfile (build context will be the current working directory) |
 
+### `sandcastle sbx build-template`
+
+Builds the Docker image from an existing `.sandcastle/` directory without host UID/GID build args, then loads that image into SBX's template store. Use this after modifying the Dockerfile for an SBX-initialized project.
+
+| Option         | Required | Default                      | Description                                                                       |
+| -------------- | -------- | ---------------------------- | --------------------------------------------------------------------------------- |
+| `--image-name` | No       | `sandcastle:<repo-dir-name>` | SBX template image name                                                           |
+| `--dockerfile` | No       | —                            | Path to a custom Dockerfile (build context will be the current working directory) |
+
 ### `sandcastle podman remove-image`
 
 Removes the Podman image.

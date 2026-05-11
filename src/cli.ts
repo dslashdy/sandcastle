@@ -368,7 +368,9 @@ const initCommand = Command.make(
           );
         } else {
           yield* d.status(
-            `Init complete! Run \`sandcastle ${selectedSandboxProvider.cliNamespace} build-image\` to build the ${providerLabel} image later.`,
+            selectedSandboxProvider.loadIntoSbxTemplateStore
+              ? `Init complete! Run \`sandcastle sbx build-template\` to build and load the ${providerLabel} template later.`
+              : `Init complete! Run \`sandcastle ${selectedSandboxProvider.cliNamespace} build-image\` to build the ${providerLabel} image later.`,
             "success",
           );
         }
@@ -536,6 +538,52 @@ const podmanCommand = Command.make("podman", {}, () =>
   Command.withSubcommands([podmanBuildImageCommand, podmanRemoveImageCommand]),
 );
 
+// --- SBX build-template command ---
+
+const sbxBuildTemplateCommand = Command.make(
+  "build-template",
+  {
+    imageName: imageNameOption,
+    dockerfile: dockerfileOption,
+  },
+  ({ imageName: imageNameFlag, dockerfile }) =>
+    Effect.gen(function* () {
+      const d = yield* Display;
+      const cwd = process.cwd();
+      yield* requireConfigDir(cwd);
+
+      const imageName = resolveImageName(imageNameFlag, cwd);
+      const dockerfileDir = join(cwd, CONFIG_DIR);
+      const dockerfilePath =
+        dockerfile._tag === "Some" ? dockerfile.value : undefined;
+
+      yield* d.spinner(
+        `Building SBX template image '${imageName}'...`,
+        buildImage(imageName, dockerfileDir, {
+          dockerfile: dockerfilePath,
+        }),
+      );
+      yield* d.spinner(
+        `Loading SBX template '${imageName}'...`,
+        loadImageIntoSbxTemplateStore(imageName),
+      );
+
+      yield* d.status("SBX template built and loaded.", "success");
+    }),
+);
+
+// --- SBX namespace command ---
+
+const sbxCommand = Command.make("sbx", {}, () =>
+  Effect.gen(function* () {
+    const d = yield* Display;
+    yield* d.status(
+      "SBX sandbox commands. Use --help to see available subcommands.",
+      "info",
+    );
+  }),
+).pipe(Command.withSubcommands([sbxBuildTemplateCommand]));
+
 // --- Root command ---
 
 const rootCommand = Command.make("sandcastle", {}, () =>
@@ -547,7 +595,12 @@ const rootCommand = Command.make("sandcastle", {}, () =>
 );
 
 export const sandcastle = rootCommand.pipe(
-  Command.withSubcommands([initCommand, dockerCommand, podmanCommand]),
+  Command.withSubcommands([
+    initCommand,
+    dockerCommand,
+    podmanCommand,
+    sbxCommand,
+  ]),
 );
 
 export const cli = Command.run(sandcastle, {
