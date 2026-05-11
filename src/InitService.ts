@@ -89,7 +89,7 @@ WORKDIR /home/agent
 # In worktree sandbox mode, Sandcastle bind-mounts the git worktree at ${SANDBOX_REPO_DIR}
 # and overrides the working directory to ${SANDBOX_REPO_DIR} at container start.
 # Structure your Dockerfile so that ${SANDBOX_REPO_DIR} can serve as the project root.
-ENTRYPOINT ["sleep", "infinity"]
+CMD ["sleep", "infinity"]
 `;
 
 const PI_DOCKERFILE = `FROM node:22-bookworm
@@ -122,7 +122,7 @@ WORKDIR /home/agent
 # In worktree sandbox mode, Sandcastle bind-mounts the git worktree at ${SANDBOX_REPO_DIR}
 # and overrides the working directory to ${SANDBOX_REPO_DIR} at container start.
 # Structure your Dockerfile so that ${SANDBOX_REPO_DIR} can serve as the project root.
-ENTRYPOINT ["sleep", "infinity"]
+CMD ["sleep", "infinity"]
 `;
 
 const CODEX_DOCKERFILE = `FROM node:22-bookworm
@@ -155,7 +155,7 @@ WORKDIR /home/agent
 # In worktree sandbox mode, Sandcastle bind-mounts the git worktree at ${SANDBOX_REPO_DIR}
 # and overrides the working directory to ${SANDBOX_REPO_DIR} at container start.
 # Structure your Dockerfile so that ${SANDBOX_REPO_DIR} can serve as the project root.
-ENTRYPOINT ["sleep", "infinity"]
+CMD ["sleep", "infinity"]
 `;
 
 const OPENCODE_DOCKERFILE = `FROM node:22-bookworm
@@ -188,7 +188,7 @@ WORKDIR /home/agent
 # In worktree sandbox mode, Sandcastle bind-mounts the git worktree at \${SANDBOX_REPO_DIR}
 # and overrides the working directory to \${SANDBOX_REPO_DIR} at container start.
 # Structure your Dockerfile so that \${SANDBOX_REPO_DIR} can serve as the project root.
-ENTRYPOINT ["sleep", "infinity"]
+CMD ["sleep", "infinity"]
 `;
 
 const AGENT_REGISTRY: AgentEntry[] = [
@@ -324,6 +324,8 @@ export interface SandboxProviderEntry {
   readonly cliNamespace?: string;
   /** Whether `sandcastle init` should offer to build an image for this provider. */
   readonly requiresImageBuild: boolean;
+  /** Whether Docker builds for this provider should align the image user to the host UID/GID. */
+  readonly useHostUidBuildArgs?: boolean;
   /** When set, only these agent names can be used with this sandbox provider. */
   readonly supportedAgentNames?: readonly string[];
   /** Provider factory expression to write in scaffolded templates. */
@@ -338,6 +340,7 @@ const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
     containerfileName: "Dockerfile",
     cliNamespace: "docker",
     requiresImageBuild: true,
+    useHostUidBuildArgs: true,
     factoryCall: () => "docker()",
   },
   {

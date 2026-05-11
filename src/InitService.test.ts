@@ -2057,6 +2057,7 @@ describe("Sandbox provider registry", () => {
     expect(provider!.containerfileName).toBe("Dockerfile");
     expect(provider!.cliNamespace).toBe("docker");
     expect(provider!.requiresImageBuild).toBe(true);
+    expect(provider!.useHostUidBuildArgs).toBe(true);
   });
 
   it("getSandboxProvider returns podman entry", () => {
@@ -2073,6 +2074,7 @@ describe("Sandbox provider registry", () => {
     expect(provider!.containerfileName).toBe("Dockerfile");
     expect(provider!.cliNamespace).toBe("docker");
     expect(provider!.requiresImageBuild).toBe(true);
+    expect(provider!.useHostUidBuildArgs).toBeUndefined();
     expect(provider!.supportedAgentNames).toEqual(["claude-code", "codex"]);
   });
 

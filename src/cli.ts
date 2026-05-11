@@ -346,7 +346,9 @@ const initCommand = Command.make(
             yield* d.spinner(
               `Building ${providerLabel} image '${imageName}'...`,
               buildImage(imageName, containerfileDir, {
-                buildArgs: defaultUidBuildArgs(),
+                buildArgs: selectedSandboxProvider.useHostUidBuildArgs
+                  ? defaultUidBuildArgs()
+                  : undefined,
               }),
             );
           }

@@ -660,7 +660,7 @@ Scaffolds the `.sandcastle/` config directory and builds the container image whe
 
 - Docker writes a `Dockerfile` and uses `sandcastle docker build-image`.
 - Podman writes a `Containerfile` and uses `sandcastle podman build-image`.
-- SBX writes a `Dockerfile`, builds it with Docker, and uses that image as the SBX template. SBX init is agent-aware and currently supports `claude-code` via `sbx({ agent: "claude", template: "sandcastle:<repo>" })` and `codex` via `sbx({ agent: "codex", template: "sandcastle:<repo>" })`.
+- SBX writes a `Dockerfile`, builds it with Docker, and uses that image as the SBX template. SBX images keep the default `agent` UID/GID expected by SBX rather than using host UID/GID build args. SBX init is agent-aware and currently supports `claude-code` via `sbx({ agent: "claude", template: "sandcastle:<repo>" })` and `codex` via `sbx({ agent: "codex", template: "sandcastle:<repo>" })`.
 
 | Option         | Required | Default                      | Description                                                          |
 | -------------- | -------- | ---------------------------- | -------------------------------------------------------------------- |
