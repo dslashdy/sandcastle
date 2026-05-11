@@ -22,6 +22,7 @@ import {
   getBacklogManager,
   listSandboxProviders,
   getSandboxProvider,
+  isSandboxProviderSupportedForAgent,
   getNextStepsLines,
 } from "./InitService.js";
 import { defaultImageName } from "./sandboxes/docker.js";
@@ -101,6 +102,11 @@ const initModelOption = Options.text("model").pipe(
   Options.optional,
 );
 
+const sandboxOption = Options.text("sandbox").pipe(
+  Options.withDescription("Sandbox provider to use (e.g. docker, podman, sbx)"),
+  Options.optional,
+);
+
 const initCommand = Command.make(
   "init",
   {
@@ -108,12 +114,14 @@ const initCommand = Command.make(
     template: templateOption,
     agent: agentOption,
     model: initModelOption,
+    sandbox: sandboxOption,
   },
   ({
     imageName: imageNameFlag,
     template,
     agent: agentFlag,
     model: modelFlag,
+    sandbox: sandboxFlag,
   }) =>
     Effect.gen(function* () {
       const d = yield* Display;
@@ -174,16 +182,45 @@ const initCommand = Command.make(
           ? modelFlag.value
           : selectedAgent.defaultModel;
 
-      // Resolve sandbox provider: interactive select (no default — user must choose)
-      const sandboxProviders = listSandboxProviders();
+      // Resolve sandbox provider: CLI flag > interactive select.
+      // Some runtimes are agent-aware: SBX currently supports Claude Code and Codex.
+      const sandboxProviders = listSandboxProviders().filter((provider) =>
+        isSandboxProviderSupportedForAgent(provider, selectedAgent),
+      );
       let selectedSandboxProvider: SandboxProviderEntry;
-      {
+      if (sandboxFlag._tag === "Some") {
+        const maybeEntry = getSandboxProvider(sandboxFlag.value);
+        if (!maybeEntry) {
+          const names = listSandboxProviders()
+            .map((provider) => provider.name)
+            .join(", ");
+          yield* Effect.fail(
+            new InitError({
+              message: `Unknown sandbox provider "${sandboxFlag.value}". Available: ${names}`,
+            }),
+          );
+        }
+        const entry = maybeEntry!;
+        if (!isSandboxProviderSupportedForAgent(entry, selectedAgent)) {
+          const supported =
+            entry.supportedAgentNames?.join(", ") ?? "all agents";
+          yield* Effect.fail(
+            new InitError({
+              message: `Sandbox provider "${entry.name}" does not support agent "${selectedAgent.name}". Supported agents: ${supported}`,
+            }),
+          );
+        }
+        selectedSandboxProvider = entry;
+      } else {
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: "Select a sandbox provider:",
             options: sandboxProviders.map((p) => ({
               value: p.name,
               label: p.label,
+              hint: p.requiresImageBuild
+                ? "Builds a local image"
+                : "Uses a prebuilt runtime",
             })),
           }),
         );
@@ -287,34 +324,44 @@ const initCommand = Command.make(
         ),
       );
 
-      // Prompt user before building image
       const providerLabel = selectedSandboxProvider.label;
-      const shouldBuild = yield* Effect.promise(() =>
-        clack.confirm({
-          message: `Build the default ${providerLabel} image now?`,
-          initialValue: true,
-        }),
-      );
 
-      if (shouldBuild === true) {
-        const containerfileDir = join(cwd, CONFIG_DIR);
-        if (selectedSandboxProvider.name === "podman") {
-          yield* d.spinner(
-            `Building ${providerLabel} image '${imageName}'...`,
-            podmanBuildImage(imageName, containerfileDir),
+      if (selectedSandboxProvider.requiresImageBuild) {
+        const shouldBuild = yield* Effect.promise(() =>
+          clack.confirm({
+            message: `Build the default ${providerLabel} image now?`,
+            initialValue: true,
+          }),
+        );
+
+        if (shouldBuild === true) {
+          const containerfileDir = join(cwd, CONFIG_DIR);
+          if (selectedSandboxProvider.name === "podman") {
+            yield* d.spinner(
+              `Building ${providerLabel} image '${imageName}'...`,
+              podmanBuildImage(imageName, containerfileDir),
+            );
+          } else {
+            yield* d.spinner(
+              `Building ${providerLabel} image '${imageName}'...`,
+              buildImage(imageName, containerfileDir, {
+                buildArgs: defaultUidBuildArgs(),
+              }),
+            );
+          }
+          yield* d.status(
+            "Init complete! Image built successfully.",
+            "success",
           );
         } else {
-          yield* d.spinner(
-            `Building ${providerLabel} image '${imageName}'...`,
-            buildImage(imageName, containerfileDir, {
-              buildArgs: defaultUidBuildArgs(),
-            }),
+          yield* d.status(
+            `Init complete! Run \`sandcastle ${selectedSandboxProvider.cliNamespace} build-image\` to build the ${providerLabel} image later.`,
+            "success",
           );
         }
-        yield* d.status("Init complete! Image built successfully.", "success");
       } else {
         yield* d.status(
-          `Init complete! Run \`sandcastle ${selectedSandboxProvider.cliNamespace} build-image\` to build the ${providerLabel} image later.`,
+          `Init complete! ${providerLabel} uses a prebuilt runtime, so no image build is needed.`,
           "success",
         );
       }

@@ -640,7 +640,7 @@ console.log(result.output.score); // typed as number
 
 ### Templates
 
-`sandcastle init` prompts you to choose a sandbox provider (Docker or Podman), a backlog manager (GitHub Issues or Beads), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Five templates are available:
+`sandcastle init` prompts you to choose a sandbox provider (Docker, Podman, or SBX), a backlog manager (GitHub Issues or Beads), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Five templates are available:
 
 | Template                       | Description                                                               |
 | ------------------------------ | ------------------------------------------------------------------------- |
@@ -656,7 +656,11 @@ Select a template during `sandcastle init` when prompted, or re-run init in a fr
 
 ### `sandcastle init`
 
-Scaffolds the `.sandcastle/` config directory and builds the container image. This is the first command you run in a new repo. You choose a sandbox provider (Docker or Podman) during init — selecting Podman writes a `Containerfile` instead of `Dockerfile` and uses `sandcastle podman build-image` for the build step.
+Scaffolds the `.sandcastle/` config directory and builds the container image when the selected sandbox provider needs one. This is the first command you run in a new repo. You choose a sandbox provider during init:
+
+- Docker writes a `Dockerfile` and uses `sandcastle docker build-image`.
+- Podman writes a `Containerfile` and uses `sandcastle podman build-image`.
+- SBX writes no containerfile and skips image build because it uses SBX's prebuilt runtimes. SBX init is agent-aware and currently supports `claude-code` via `sbx({ agent: "claude" })` and `codex` via `sbx({ agent: "codex" })`.
 
 | Option         | Required | Default                      | Description                                                          |
 | -------------- | -------- | ---------------------------- | -------------------------------------------------------------------- |
@@ -664,12 +668,13 @@ Scaffolds the `.sandcastle/` config directory and builds the container image. Th
 | `--agent`      | No       | Interactive prompt           | Agent to use (`claude-code`, `pi`, `codex`, `opencode`)              |
 | `--model`      | No       | Agent's default model        | Model to use (e.g. `claude-sonnet-4-6`). Defaults to agent's default |
 | `--template`   | No       | Interactive prompt           | Template to scaffold (e.g. `blank`, `simple-loop`)                   |
+| `--sandbox`    | No       | Interactive prompt           | Sandbox provider to use (`docker`, `podman`, `sbx`)                  |
 
-Creates the following files:
+Creates the following files. Docker creates `Dockerfile`, Podman creates `Containerfile`, and SBX omits the containerfile because it uses prebuilt runtimes.
 
 ```
 .sandcastle/
-├── Dockerfile      # Sandbox environment (customize as needed)
+├── Dockerfile      # Docker only; Containerfile for Podman; omitted for SBX
 ├── prompt.md       # Agent instructions
 ├── .env.example    # Token placeholders
 └── .gitignore      # Ignores .env, logs/

@@ -83,6 +83,11 @@ describe("sandcastle CLI", () => {
     expect(stdout).toContain("--model");
   });
 
+  it("init --help exposes --sandbox flag", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--sandbox");
+  });
+
   it("init --template nonexistent produces error listing available templates", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
     await initRepo(hostDir);
@@ -164,6 +169,43 @@ describe("sandcastle CLI", () => {
       const output = stdout + stderr;
       expect(output).toContain("nonexistent");
       expect(output).toContain("claude-code");
+    }
+  });
+
+  it("init --sandbox nonexistent produces error listing available sandbox providers", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli(
+        "init --agent claude-code --template blank --sandbox nonexistent",
+        hostDir,
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("nonexistent");
+      expect(output).toContain("docker");
+      expect(output).toContain("podman");
+      expect(output).toContain("sbx");
+    }
+  });
+
+  it("init --sandbox sbx rejects unsupported agents", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli("init --agent pi --template blank --sandbox sbx", hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("sbx");
+      expect(output).toContain("pi");
+      expect(output).toContain("claude-code");
+      expect(output).toContain("codex");
     }
   });
 });

@@ -315,24 +315,49 @@ export const getAgent = (name: string): AgentEntry | undefined =>
 export interface SandboxProviderEntry {
   readonly name: string;
   readonly label: string;
-  /** Filename written to .sandcastle/ (e.g. "Dockerfile" or "Containerfile") */
-  readonly containerfileName: string;
-  /** CLI namespace for build/remove commands (e.g. "docker" or "podman") */
-  readonly cliNamespace: string;
+  /** Import name used in scaffolded `.sandcastle/main.*` files. */
+  readonly factoryImport: string;
+  /** Filename written to .sandcastle/ (e.g. "Dockerfile" or "Containerfile"). Omitted for prebuilt runtimes. */
+  readonly containerfileName?: string;
+  /** CLI namespace for build/remove commands (e.g. "docker" or "podman"). Omitted when no build command exists. */
+  readonly cliNamespace?: string;
+  /** Whether `sandcastle init` should offer to build an image for this provider. */
+  readonly requiresImageBuild: boolean;
+  /** When set, only these agent names can be used with this sandbox provider. */
+  readonly supportedAgentNames?: readonly string[];
+  /** Provider factory expression to write in scaffolded templates. */
+  readonly factoryCall: (agent: AgentEntry) => string;
 }
 
 const SANDBOX_PROVIDER_REGISTRY: SandboxProviderEntry[] = [
   {
     name: "docker",
     label: "Docker",
+    factoryImport: "docker",
     containerfileName: "Dockerfile",
     cliNamespace: "docker",
+    requiresImageBuild: true,
+    factoryCall: () => "docker()",
   },
   {
     name: "podman",
     label: "Podman",
+    factoryImport: "podman",
     containerfileName: "Containerfile",
     cliNamespace: "podman",
+    requiresImageBuild: true,
+    factoryCall: () => "podman()",
+  },
+  {
+    name: "sbx",
+    label: "SBX",
+    factoryImport: "sbx",
+    requiresImageBuild: false,
+    supportedAgentNames: ["claude-code", "codex"],
+    factoryCall: (agent) => {
+      const sbxAgent = agent.name === "claude-code" ? "claude" : agent.name;
+      return `sbx({ agent: "${sbxAgent}" })`;
+    },
   },
 ];
 
@@ -343,6 +368,21 @@ export const getSandboxProvider = (
   name: string,
 ): SandboxProviderEntry | undefined =>
   SANDBOX_PROVIDER_REGISTRY.find((p) => p.name === name);
+
+export const isSandboxProviderSupportedForAgent = (
+  provider: SandboxProviderEntry,
+  agent: AgentEntry,
+): boolean =>
+  provider.supportedAgentNames === undefined ||
+  provider.supportedAgentNames.includes(agent.name);
+
+const unsupportedSandboxProviderMessage = (
+  provider: SandboxProviderEntry,
+  agent: AgentEntry,
+): string => {
+  const supported = provider.supportedAgentNames?.join(", ") ?? "all agents";
+  return `Sandbox provider "${provider.name}" does not support agent "${agent.name}". Supported agents: ${supported}`;
+};
 
 // ---------------------------------------------------------------------------
 // Next steps
@@ -488,6 +528,50 @@ const rewriteMainTs = (
     content = content.replace(
       factoryCallRe,
       `${agent.factoryImport}("${model}")`,
+    );
+
+    yield* fs
+      .writeFileString(mainTsPath, content)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+  });
+
+/**
+ * Replace the scaffolded sandbox provider import and factory call.
+ *
+ * Templates use Docker as the default placeholder provider. During init we
+ * rewrite that placeholder to the selected provider, including agent-aware
+ * providers like SBX.
+ */
+const rewriteSandboxProvider = (
+  configDir: string,
+  sandboxProvider: SandboxProviderEntry,
+  agent: AgentEntry,
+  mainFilename: string,
+): Effect.Effect<void, Error, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const mainTsPath = join(configDir, mainFilename);
+
+    const exists = yield* fs
+      .exists(mainTsPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    if (!exists) return;
+
+    let content = yield* fs
+      .readFileString(mainTsPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+
+    content = content.replace(
+      /import \{ docker \} from "@ai-hero\/sandcastle\/sandboxes\/docker";/g,
+      `import { ${sandboxProvider.factoryImport} } from "@ai-hero/sandcastle/sandboxes/${sandboxProvider.name}";`,
+    );
+    content = content.replace(
+      /\bsandbox:\s*docker\(\)/g,
+      `sandbox: ${sandboxProvider.factoryCall(agent)}`,
+    );
+    content = content.replace(
+      /Docker is the default runtime/g,
+      `${sandboxProvider.label} is the selected runtime`,
     );
 
     yield* fs
@@ -661,6 +745,12 @@ export const scaffold = (
 
     const mainFilename = yield* detectMainFilename(repoDir);
 
+    if (!isSandboxProviderSupportedForAgent(sandboxProvider, agent)) {
+      yield* Effect.fail(
+        new Error(unsupportedSandboxProviderMessage(sandboxProvider, agent)),
+      );
+    }
+
     yield* fs
       .makeDirectory(configDir, { recursive: false })
       .pipe(Effect.mapError((e) => new Error(e.message)));
@@ -674,27 +764,39 @@ export const scaffold = (
     }
     const envExampleContent = envExampleParts.join("\n") + "\n";
 
-    yield* Effect.all(
-      [
+    const scaffoldEffects = [
+      fs
+        .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
+        .pipe(Effect.mapError((e) => new Error(e.message))),
+      fs
+        .writeFileString(join(configDir, ".env.example"), envExampleContent)
+        .pipe(Effect.mapError((e) => new Error(e.message))),
+      copyTemplateFiles(templateDir, configDir, mainFilename),
+    ];
+
+    if (sandboxProvider.containerfileName !== undefined) {
+      scaffoldEffects.push(
         fs
           .writeFileString(
             join(configDir, sandboxProvider.containerfileName),
             agent.dockerfileTemplate,
           )
           .pipe(Effect.mapError((e) => new Error(e.message))),
-        fs
-          .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
-          .pipe(Effect.mapError((e) => new Error(e.message))),
-        fs
-          .writeFileString(join(configDir, ".env.example"), envExampleContent)
-          .pipe(Effect.mapError((e) => new Error(e.message))),
-        copyTemplateFiles(templateDir, configDir, mainFilename),
-      ],
-      { concurrency: "unbounded" },
-    );
+      );
+    }
+
+    yield* Effect.all(scaffoldEffects, { concurrency: "unbounded" });
 
     // Rewrite main file with the selected agent factory and model
     yield* rewriteMainTs(configDir, agent, model, mainFilename);
+
+    // Rewrite main file with the selected sandbox provider
+    yield* rewriteSandboxProvider(
+      configDir,
+      sandboxProvider,
+      agent,
+      mainFilename,
+    );
 
     // Replace backlog manager template arguments in all text files (must run before label stripping)
     yield* substituteTemplateArgs(configDir, backlogManager);

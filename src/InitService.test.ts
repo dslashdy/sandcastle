@@ -1903,6 +1903,7 @@ describe("InitService scaffold", () => {
   describe("sandbox provider", () => {
     const dockerProvider = getSandboxProvider("docker")!;
     const podmanProvider = getSandboxProvider("podman")!;
+    const sbxProvider = getSandboxProvider("sbx")!;
 
     it("selecting docker writes Dockerfile to .sandcastle/", async () => {
       const dir = await makeDir();
@@ -1928,6 +1929,22 @@ describe("InitService scaffold", () => {
       expect(containerfile).not.toContain("{{BACKLOG_MANAGER_TOOLS}}");
     });
 
+    it("selecting podman rewrites main file to use podman()", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: podmanProvider });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        'import { podman } from "@ai-hero/sandcastle/sandboxes/podman"',
+      );
+      expect(mainTs).toContain("sandbox: podman()");
+      expect(mainTs).not.toContain("sandboxes/docker");
+      expect(mainTs).not.toContain("sandbox: docker()");
+    });
+
     it("selecting podman does not write Dockerfile", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { sandboxProvider: podmanProvider });
@@ -1947,6 +1964,58 @@ describe("InitService scaffold", () => {
         access(join(dir, ".sandcastle", "Containerfile")),
       ).rejects.toThrow();
     });
+
+    it("selecting sbx for claude-code writes no containerfile and uses the claude runtime", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { sandboxProvider: sbxProvider });
+
+      const { access } = await import("node:fs/promises");
+      await expect(
+        access(join(dir, ".sandcastle", "Dockerfile")),
+      ).rejects.toThrow();
+      await expect(
+        access(join(dir, ".sandcastle", "Containerfile")),
+      ).rejects.toThrow();
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain(
+        'import { sbx } from "@ai-hero/sandcastle/sandboxes/sbx"',
+      );
+      expect(mainTs).toContain('sandbox: sbx({ agent: "claude" })');
+      expect(mainTs).not.toContain("sandboxes/docker");
+      expect(mainTs).not.toContain("sandbox: docker()");
+    });
+
+    it("selecting sbx for codex uses the codex runtime", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        agent: codexAgent,
+        model: "gpt-5.4-mini",
+        sandboxProvider: sbxProvider,
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain('codex("gpt-5.4-mini")');
+      expect(mainTs).toContain('sandbox: sbx({ agent: "codex" })');
+    });
+
+    it("rejects sbx for unsupported agents", async () => {
+      const dir = await makeDir();
+
+      await expect(
+        runScaffold(dir, {
+          agent: piAgent,
+          model: "claude-sonnet-4-6",
+          sandboxProvider: sbxProvider,
+        }),
+      ).rejects.toThrow('Sandbox provider "sbx" does not support agent "pi"');
+    });
   });
 });
 
@@ -1955,10 +2024,11 @@ describe("InitService scaffold", () => {
 // ---------------------------------------------------------------------------
 
 describe("Sandbox provider registry", () => {
-  it("listSandboxProviders returns docker and podman", () => {
+  it("listSandboxProviders returns docker, podman, and sbx", () => {
     const providers = listSandboxProviders();
     expect(providers.some((p) => p.name === "docker")).toBe(true);
     expect(providers.some((p) => p.name === "podman")).toBe(true);
+    expect(providers.some((p) => p.name === "sbx")).toBe(true);
   });
 
   it("getSandboxProvider returns docker entry", () => {
@@ -1966,6 +2036,7 @@ describe("Sandbox provider registry", () => {
     expect(provider).toBeDefined();
     expect(provider!.containerfileName).toBe("Dockerfile");
     expect(provider!.cliNamespace).toBe("docker");
+    expect(provider!.requiresImageBuild).toBe(true);
   });
 
   it("getSandboxProvider returns podman entry", () => {
@@ -1973,6 +2044,16 @@ describe("Sandbox provider registry", () => {
     expect(provider).toBeDefined();
     expect(provider!.containerfileName).toBe("Containerfile");
     expect(provider!.cliNamespace).toBe("podman");
+    expect(provider!.requiresImageBuild).toBe(true);
+  });
+
+  it("getSandboxProvider returns sbx entry", () => {
+    const provider = getSandboxProvider("sbx");
+    expect(provider).toBeDefined();
+    expect(provider!.containerfileName).toBeUndefined();
+    expect(provider!.cliNamespace).toBeUndefined();
+    expect(provider!.requiresImageBuild).toBe(false);
+    expect(provider!.supportedAgentNames).toEqual(["claude-code", "codex"]);
   });
 
   it("getSandboxProvider returns undefined for unknown provider", () => {
