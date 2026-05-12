@@ -1165,8 +1165,11 @@ describe("InitService scaffold", () => {
       expect(manager!.templateArgs.LIST_TASKS_COMMAND).toContain(
         "gh issue list",
       );
+      expect(manager!.templateArgs.LIST_TASKS_COMMAND).toContain("--limit 20");
       expect(manager!.templateArgs.LIST_TASKS_COMMAND).toContain("labels");
-      expect(manager!.templateArgs.LIST_TASKS_COMMAND).toContain("comments");
+      expect(manager!.templateArgs.LIST_TASKS_COMMAND).not.toContain(
+        "comments",
+      );
       expect(manager!.templateArgs.VIEW_TASK_COMMAND).toContain(
         "gh issue view",
       );
@@ -1218,8 +1221,9 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(prompt).toContain("gh issue list");
+      expect(prompt).toContain("--limit 20");
       expect(prompt).toContain("labels");
-      expect(prompt).toContain("comments");
+      expect(prompt).not.toContain(".comments");
       expect(prompt).toContain("gh issue close");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
       expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
@@ -1327,8 +1331,9 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(prompt).toContain("gh issue list");
+      expect(prompt).toContain("--limit 20");
       expect(prompt).toContain("labels");
-      expect(prompt).toContain("comments");
+      expect(prompt).not.toContain(".comments");
       expect(prompt).toContain("gh issue close");
       expect(prompt).not.toContain("{{LIST_TASKS_COMMAND}}");
       expect(prompt).not.toContain("{{CLOSE_TASK_COMMAND}}");
@@ -1411,8 +1416,9 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(planPrompt).toContain("gh issue list");
+      expect(planPrompt).toContain("--limit 20");
       expect(planPrompt).toContain("labels");
-      expect(planPrompt).toContain("comments");
+      expect(planPrompt).not.toContain("comments");
       expect(planPrompt).not.toContain("{{LIST_TASKS_COMMAND}}");
     });
 
@@ -1564,8 +1570,9 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(planPrompt).toContain("gh issue list");
+      expect(planPrompt).toContain("--limit 20");
       expect(planPrompt).toContain("labels");
-      expect(planPrompt).toContain("comments");
+      expect(planPrompt).not.toContain("comments");
       expect(planPrompt).not.toContain("{{LIST_TASKS_COMMAND}}");
     });
 
