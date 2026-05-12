@@ -127,9 +127,7 @@ const invokeAgent = (
           errorDetail = resultText;
         }
         if (!errorDetail.trim()) {
-          const lines = execResult.stdout
-            .split("\n")
-            .filter((l) => l.trim());
+          const lines = execResult.stdout.split("\n").filter((l) => l.trim());
           errorDetail = lines.slice(-20).join("\n");
         }
         return yield* Effect.fail(
@@ -376,25 +374,35 @@ export const orchestrate = (
                     sandboxProjectsDir,
                   );
                   const hStore = hostSessionStore(hostRepoDir, hostProjectsDir);
-                  yield* Effect.tryPromise({
-                    try: () => transferSession(sbStore, hStore, sessionId),
-                    catch: (e) =>
-                      new SessionCaptureError({
-                        message: `Session capture failed: ${e instanceof Error ? e.message : String(e)}`,
-                        sessionId,
-                      }),
-                  });
-                  sessionFilePath = hStore.sessionFilePath(sessionId);
+                  const captureResult = yield* Effect.either(
+                    Effect.tryPromise({
+                      try: () => transferSession(sbStore, hStore, sessionId),
+                      catch: (e) =>
+                        new SessionCaptureError({
+                          message: `Session capture failed: ${e instanceof Error ? e.message : String(e)}`,
+                          sessionId,
+                        }),
+                    }),
+                  );
 
-                  // Parse token usage from the captured session JSONL
-                  if (provider.parseSessionUsage) {
-                    const content = yield* Effect.promise(() =>
-                      hStore
-                        .readSession(sessionId)
-                        .catch(() => undefined as string | undefined),
+                  if (captureResult._tag === "Left") {
+                    yield* display.status(
+                      label(captureResult.left.message),
+                      "warn",
                     );
-                    if (content) {
-                      usage = provider.parseSessionUsage(content);
+                  } else {
+                    sessionFilePath = hStore.sessionFilePath(sessionId);
+
+                    // Parse token usage from the captured session JSONL
+                    if (provider.parseSessionUsage) {
+                      const content = yield* Effect.promise(() =>
+                        hStore
+                          .readSession(sessionId)
+                          .catch(() => undefined as string | undefined),
+                      );
+                      if (content) {
+                        usage = provider.parseSessionUsage(content);
+                      }
                     }
                   }
                 }
