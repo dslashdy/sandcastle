@@ -1,10 +1,14 @@
 import { Effect, Layer, Ref } from "effect";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { type DisplayEntry, SilentDisplay } from "./Display.js";
-import { preprocessPrompt } from "./PromptPreprocessor.js";
+import {
+  DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS,
+  preprocessPrompt,
+  resolvePromptExpansionTimeoutMs,
+} from "./PromptPreprocessor.js";
 import { substitutePromptArgs } from "./PromptArgumentSubstitution.js";
 import { Sandbox } from "./SandboxFactory.js";
 import { makeLocalSandboxLayer } from "./testSandbox.js";
@@ -38,6 +42,33 @@ describe("PromptPreprocessor", () => {
       ),
     );
   };
+
+  it("uses a 120 second default prompt expansion timeout", () => {
+    expect(resolvePromptExpansionTimeoutMs({})).toBe(
+      DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS,
+    );
+  });
+
+  it("allows prompt expansion timeout override via env", () => {
+    expect(
+      resolvePromptExpansionTimeoutMs({
+        SANDCASTLE_PROMPT_EXPANSION_TIMEOUT_MS: "180000",
+      }),
+    ).toBe(180_000);
+  });
+
+  it("ignores invalid prompt expansion timeout env values", () => {
+    expect(
+      resolvePromptExpansionTimeoutMs({
+        SANDCASTLE_PROMPT_EXPANSION_TIMEOUT_MS: "nope",
+      }),
+    ).toBe(DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS);
+    expect(
+      resolvePromptExpansionTimeoutMs({
+        SANDCASTLE_PROMPT_EXPANSION_TIMEOUT_MS: "-1",
+      }),
+    ).toBe(DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS);
+  });
 
   it("passes through prompts with no !`command` expressions unchanged", async () => {
     const { sandboxDir, layer } = await setup();
@@ -82,7 +113,7 @@ describe("PromptPreprocessor", () => {
     const { sandboxDir, layer } = await setup();
     const prompt = "Dir: !`pwd`";
     const result = await run(prompt, layer, sandboxDir);
-    expect(result).toBe(`Dir: ${sandboxDir}`);
+    expect(result).toBe(`Dir: ${await realpath(sandboxDir)}`);
   });
 
   it("runs multiple shell expressions in parallel", async () => {

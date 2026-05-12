@@ -8,7 +8,22 @@ import {
 import type { ExecError } from "./errors.js";
 import type { SandboxService } from "./SandboxFactory.js";
 
-const PROMPT_EXPANSION_TIMEOUT_MS = 30_000;
+export const DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS = 120_000;
+const PROMPT_EXPANSION_TIMEOUT_ENV = "SANDCASTLE_PROMPT_EXPANSION_TIMEOUT_MS";
+
+export const resolvePromptExpansionTimeoutMs = (
+  env: NodeJS.ProcessEnv = process.env,
+): number => {
+  const raw = env[PROMPT_EXPANSION_TIMEOUT_ENV];
+  if (!raw || raw.trim() === "") return DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_PROMPT_EXPANSION_TIMEOUT_MS;
+  }
+
+  return parsed;
+};
 
 /**
  * @internal
@@ -39,6 +54,8 @@ export const preprocessPrompt = (
     return Effect.succeed(prompt.replaceAll(SHELL_BLOCK_MARKER, ""));
   }
 
+  const promptExpansionTimeoutMs = resolvePromptExpansionTimeoutMs();
+
   return Effect.gen(function* () {
     const display = yield* Display;
     return yield* display.taskLog("Expanding shell expressions", (message) =>
@@ -59,11 +76,11 @@ export const preprocessPrompt = (
                   : Effect.succeed(execResult.stdout.trimEnd()),
             ).pipe(
               withTimeout(
-                PROMPT_EXPANSION_TIMEOUT_MS,
+                promptExpansionTimeoutMs,
                 () =>
                   new PromptExpansionTimeoutError({
-                    message: `Shell expression \`${command}\` timed out after ${PROMPT_EXPANSION_TIMEOUT_MS}ms`,
-                    timeoutMs: PROMPT_EXPANSION_TIMEOUT_MS,
+                    message: `Shell expression \`${command}\` timed out after ${promptExpansionTimeoutMs}ms`,
+                    timeoutMs: promptExpansionTimeoutMs,
                     expression: command,
                   }),
               ),
