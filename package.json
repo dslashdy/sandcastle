@@ -46,7 +46,7 @@
     "typecheck": "tsgo --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepare": "husky",
+    "prepare": "npm run build && (husky || true)",
     "release": "changeset publish",
     "sandcastle": "npm run build && tsx .sandcastle/run.ts",
     "test-sbx-claude": "npm run build && tsx .sandcastle/test-sbx-claude.ts",
