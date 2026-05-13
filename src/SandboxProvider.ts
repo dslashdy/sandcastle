@@ -43,6 +43,7 @@ export interface BindMountSandboxHandle {
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
+      signal?: AbortSignal;
     },
   ): Promise<ExecResult>;
   /**
@@ -120,6 +121,7 @@ export interface IsolatedSandboxHandle {
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
+      signal?: AbortSignal;
     },
   ): Promise<ExecResult>;
   /**
@@ -212,6 +214,7 @@ export interface NoSandboxHandle {
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
+      signal?: AbortSignal;
     },
   ): Promise<ExecResult>;
   /**

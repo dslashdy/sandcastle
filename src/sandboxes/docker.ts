@@ -207,6 +207,7 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
             cwd?: string;
             sudo?: boolean;
             stdin?: string;
+            signal?: AbortSignal;
           },
         ): Promise<ExecResult> => {
           const effectiveCommand = opts?.sudo ? `sudo ${command}` : command;
@@ -216,6 +217,11 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
           args.push(containerName, "sh", "-c", effectiveCommand);
 
           return new Promise((resolve, reject) => {
+            if (opts?.signal?.aborted) {
+              reject(opts.signal.reason ?? new Error("docker exec aborted"));
+              return;
+            }
+
             const proc = spawn("docker", args, {
               stdio: [
                 opts?.stdin !== undefined ? "pipe" : "ignore",
@@ -223,6 +229,17 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
                 "pipe",
               ],
             });
+
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            const abort = () => {
+              proc.kill("SIGTERM");
+              killTimer = setTimeout(() => {
+                if (proc.exitCode === null && proc.signalCode === null) {
+                  proc.kill("SIGKILL");
+                }
+              }, 2000);
+            };
+            opts?.signal?.addEventListener("abort", abort, { once: true });
 
             if (opts?.stdin !== undefined) {
               proc.stdin!.write(opts.stdin);
@@ -250,10 +267,14 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
             });
 
             proc.on("error", (error) => {
+              opts?.signal?.removeEventListener("abort", abort);
+              if (killTimer) clearTimeout(killTimer);
               reject(new Error(`docker exec failed: ${error.message}`));
             });
 
             proc.on("close", (code) => {
+              opts?.signal?.removeEventListener("abort", abort);
+              if (killTimer) clearTimeout(killTimer);
               resolve({
                 stdout: stdoutChunks.join(opts?.onLine ? "\n" : ""),
                 stderr: stderrChunks.join(""),

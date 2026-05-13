@@ -19,6 +19,8 @@ import {
   transferSession,
 } from "./SessionStore.js";
 import { SessionPaths } from "./SessionPaths.js";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export type { ParsedStreamEvent, IterationUsage } from "./AgentProvider.js";
 
@@ -32,6 +34,7 @@ const invokeAgent = (
   idleTimeoutMs: number,
   onText: (text: string) => void,
   onToolCall: (name: string, formattedArgs: string) => void,
+  onRawLine: (line: string) => void,
   onIdleWarning: (minutes: number) => void,
   idleWarningIntervalMs: number = IDLE_WARNING_INTERVAL_MS,
   resumeSession?: string,
@@ -40,6 +43,7 @@ const invokeAgent = (
   Effect.gen(function* () {
     let resultText = "";
     let sessionId: string | undefined;
+    const agentAbortController = new AbortController();
 
     // Deferred that will be failed when the idle timer fires
     const timeoutSignal = yield* Deferred.make<never, AgentIdleTimeoutError>();
@@ -61,15 +65,14 @@ const invokeAgent = (
     const resetIdleTimer = () => {
       if (timeoutHandle !== null) clearTimeout(timeoutHandle);
       timeoutHandle = setTimeout(() => {
-        Effect.runPromise(
-          Deferred.fail(
-            timeoutSignal,
-            new AgentIdleTimeoutError({
-              message: `Agent idle for ${idleTimeoutMs / 1000} seconds — no output received. Consider increasing the idle timeout with --idle-timeout.`,
-              timeoutMs: idleTimeoutMs,
-            }),
-          ),
-        ).catch(() => {});
+        const idleError = new AgentIdleTimeoutError({
+          message: `Agent idle for ${idleTimeoutMs / 1000} seconds — no output received. Consider increasing the idle timeout with --idle-timeout.`,
+          timeoutMs: idleTimeoutMs,
+        });
+        Effect.runPromise(Deferred.fail(timeoutSignal, idleError)).catch(
+          () => {},
+        );
+        agentAbortController.abort(idleError);
       }, idleTimeoutMs);
       // Reset warning interval on activity
       startWarningInterval();
@@ -84,6 +87,7 @@ const invokeAgent = (
         return yield* Effect.die(signal.reason);
       }
       const onAbort = () => {
+        agentAbortController.abort(signal.reason);
         Effect.runPromise(Deferred.die(abortDeferred, signal.reason)).catch(
           () => {},
         );
@@ -103,6 +107,7 @@ const invokeAgent = (
       const execResult = yield* sandbox.exec(printCmd.command, {
         onLine: (line) => {
           resetIdleTimer();
+          onRawLine(line);
           for (const parsed of provider.parseStreamLine(line)) {
             if (parsed.type === "text") {
               onText(parsed.text);
@@ -117,6 +122,7 @@ const invokeAgent = (
         },
         cwd: sandboxRepoDir,
         stdin: printCmd.stdin,
+        signal: agentAbortController.signal,
       });
 
       if (execResult.exitCode !== 0) {
@@ -187,6 +193,8 @@ export interface OrchestrateOptions {
   readonly name?: string;
   /** @internal Test-only override for the idle warning interval in milliseconds. Default: 60000 (1 minute). */
   readonly _idleWarningIntervalMs?: number;
+  /** Optional path for raw agent stdout stream JSONL diagnostics. */
+  readonly rawLogFilePath?: string;
   /** Resume a prior Claude Code session by ID. Applied to iteration 1 only. */
   readonly resumeSession?: string;
   /** An AbortSignal that cancels the orchestration when aborted. */
@@ -213,6 +221,8 @@ export interface OrchestrateResult {
   readonly stdout: string;
   readonly commits: { sha: string }[];
   readonly branch: string;
+  /** Host path to raw agent stdout stream diagnostics, when enabled. */
+  readonly rawLogFilePath?: string;
   /** Host path to the preserved worktree from the last iteration, set when the worktree was left behind due to uncommitted changes on a successful run. */
   readonly preservedWorktreePath?: string;
 }
@@ -250,6 +260,27 @@ export const orchestrate = (
     let allStdout = "";
     let resolvedBranch = "";
     let iterationPreservedPath: string | undefined;
+
+    const writeRawLog = (event: Record<string, unknown>): void => {
+      if (!options.rawLogFilePath) return;
+      try {
+        mkdirSync(dirname(options.rawLogFilePath), { recursive: true });
+        appendFileSync(
+          options.rawLogFilePath,
+          JSON.stringify({ timestamp: new Date().toISOString(), ...event }) +
+            "\n",
+        );
+      } catch {
+        // Raw logging is diagnostic only; it must never break the run.
+      }
+    };
+
+    writeRawLog({
+      type: "run_start",
+      name: options.name,
+      branch,
+      provider: provider.name,
+    });
 
     // Helper: check abort signal and bail via defect so run() can
     // re-throw the signal's reason verbatim (no Sandcastle wrapping).
@@ -337,11 +368,23 @@ export const orchestrate = (
                     }),
                   );
                 };
+                const onRawLine = (line: string) => {
+                  writeRawLog({
+                    type: "stdout_line",
+                    iteration: i,
+                    line,
+                  });
+                };
                 const onIdleWarning = (minutes: number) => {
                   const msg =
                     minutes === 1
                       ? "Agent idle for 1 minute"
                       : `Agent idle for ${minutes} minutes`;
+                  writeRawLog({
+                    type: "idle_warning",
+                    iteration: i,
+                    idleMinutes: minutes,
+                  });
                   Effect.runPromise(display.status(label(msg), "warn"));
                 };
                 const { result: agentOutput, sessionId } = yield* invokeAgent(
@@ -352,6 +395,7 @@ export const orchestrate = (
                   idleTimeoutMs,
                   onText,
                   onToolCall,
+                  onRawLine,
                   onIdleWarning,
                   options._idleWarningIntervalMs,
                   iterationResumeSession,
@@ -461,6 +505,7 @@ export const orchestrate = (
       stdout: allStdout,
       commits: allCommits,
       branch: resolvedBranch,
+      rawLogFilePath: options.rawLogFilePath,
       preservedWorktreePath: iterationPreservedPath,
     };
   });

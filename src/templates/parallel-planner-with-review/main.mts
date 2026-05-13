@@ -31,6 +31,11 @@ import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
 // Maximum number of plan→execute→merge cycles before stopping.
 // Raise this if your backlog is large; lower it for a quick smoke-test run.
 const MAX_ITERATIONS = 10;
+const PLANNER_IDLE_TIMEOUT_SECONDS = 180;
+const IMPLEMENTER_IDLE_TIMEOUT_SECONDS = 300;
+const REVIEWER_IDLE_TIMEOUT_SECONDS = 180;
+const MERGER_IDLE_TIMEOUT_SECONDS = 300;
+const IMPLEMENTER_IDLE_RETRIES = 1;
 
 // Hooks run inside the sandbox before the agent starts each iteration.
 // npm install ensures the sandbox always has fresh dependencies.
@@ -42,6 +47,34 @@ const hooks = {
 // starts. Avoids a full npm install from scratch; the hook above handles
 // platform-specific binaries and any packages added since the last copy.
 const copyToWorktree = ["node_modules"];
+
+const isIdleTimeout = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  ("_tag" in error
+    ? error._tag === "AgentIdleTimeoutError"
+    : "message" in error &&
+      typeof error.message === "string" &&
+      error.message.includes("Agent idle"));
+
+const retryIdleTimeout = async <T extends unknown>(
+  label: string,
+  run: () => Promise<T>,
+  retries = IMPLEMENTER_IDLE_RETRIES,
+): Promise<T> => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      if (!isIdleTimeout(error) || attempt >= retries) {
+        throw error;
+      }
+      console.warn(
+        `[${label}] idle timeout; retrying in the same sandbox (${attempt + 1}/${retries})`,
+      );
+    }
+  }
+};
 
 // ---------------------------------------------------------------------------
 // Main loop
@@ -68,6 +101,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     maxIterations: 1,
     // Opus for planning: dependency analysis benefits from deeper reasoning.
     agent: sandcastle.claudeCode("claude-opus-4-7"),
+    idleTimeoutSeconds: PLANNER_IDLE_TIMEOUT_SECONDS,
     promptFile: "./.sandcastle/plan-prompt.md",
   });
 
@@ -118,17 +152,22 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
       try {
         // Run the implementer
-        const implement = await sandbox.run({
-          name: "implementer",
-          maxIterations: 100,
-          agent: sandcastle.claudeCode("claude-sonnet-4-6"),
-          promptFile: "./.sandcastle/implement-prompt.md",
-          promptArgs: {
-            TASK_ID: issue.id,
-            ISSUE_TITLE: issue.title,
-            BRANCH: issue.branch,
-          },
-        });
+        const implement = await retryIdleTimeout(
+          `implementer:${issue.id}`,
+          () =>
+            sandbox.run({
+              name: "implementer",
+              maxIterations: 100,
+              agent: sandcastle.claudeCode("claude-sonnet-4-6"),
+              idleTimeoutSeconds: IMPLEMENTER_IDLE_TIMEOUT_SECONDS,
+              promptFile: "./.sandcastle/implement-prompt.md",
+              promptArgs: {
+                TASK_ID: issue.id,
+                ISSUE_TITLE: issue.title,
+                BRANCH: issue.branch,
+              },
+            }),
+        );
 
         // Only review if the implementer produced commits
         if (implement.commits.length > 0) {
@@ -136,6 +175,7 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
             name: "reviewer",
             maxIterations: 1,
             agent: sandcastle.claudeCode("claude-sonnet-4-6"),
+            idleTimeoutSeconds: REVIEWER_IDLE_TIMEOUT_SECONDS,
             promptFile: "./.sandcastle/review-prompt.md",
             promptArgs: {
               BRANCH: issue.branch,
@@ -207,14 +247,13 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     name: "merger",
     maxIterations: 1,
     agent: sandcastle.claudeCode("claude-sonnet-4-6"),
+    idleTimeoutSeconds: MERGER_IDLE_TIMEOUT_SECONDS,
     promptFile: "./.sandcastle/merge-prompt.md",
     promptArgs: {
       // A markdown list of branch names, one per line.
       BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
       // A markdown list of issue IDs and titles, one per line.
-      ISSUES: completedIssues
-        .map((i) => `- ${i.id}: ${i.title}`)
-        .join("\n"),
+      ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
     },
   });
 

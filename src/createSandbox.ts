@@ -27,7 +27,11 @@ import {
 import { resolvePrompt } from "./PromptResolver.js";
 import { preprocessPrompt } from "./PromptPreprocessor.js";
 import type { LoggingOption, Timeouts } from "./run.js";
-import { buildLogFilename, printFileDisplayStartup } from "./run.js";
+import {
+  buildLogFilename,
+  buildRawLogFilePath,
+  printFileDisplayStartup,
+} from "./run.js";
 import {
   withSandboxLifecycle,
   runHostHooks,
@@ -126,6 +130,8 @@ export interface SandboxRunResult {
   readonly commits: { sha: string }[];
   /** Path to the log file, if logging was drained to a file. */
   readonly logFilePath?: string;
+  /** Path to raw agent stdout stream diagnostics, if logging was drained to a file. */
+  readonly rawLogFilePath?: string;
 }
 
 export interface SandboxInteractiveOptions {
@@ -273,12 +279,17 @@ const buildSandboxHandle = (
           buildLogFilename(branch, undefined, runOptions.name),
         ),
       };
+      const rawLogFilePath =
+        resolvedLogging.type === "file"
+          ? buildRawLogFilePath(resolvedLogging.path)
+          : undefined;
 
       const runDisplayLayer =
         resolvedLogging.type === "file"
           ? (() => {
               printFileDisplayStartup({
                 logPath: resolvedLogging.path,
+                rawLogPath: rawLogFilePath,
                 agentName: runOptions.name,
                 branch,
               });
@@ -334,6 +345,7 @@ const buildSandboxHandle = (
               name: runOptions.name,
               signal: runOptions.signal,
               skipPromptExpansion: isInlinePrompt,
+              rawLogFilePath,
             });
           }).pipe(Effect.provide(runLayer)),
         );
@@ -350,6 +362,7 @@ const buildSandboxHandle = (
         commits: result.commits,
         logFilePath:
           resolvedLogging.type === "file" ? resolvedLogging.path : undefined,
+        rawLogFilePath,
       };
     },
 
@@ -528,7 +541,12 @@ export const createSandboxFromWorktree = async (
     options.sandbox.tag !== "isolated"
   ) {
     await Effect.runPromise(
-      copyToWorktree(options.copyToWorktree, hostRepoDir, worktreePath, options.timeouts?.copyToWorktreeMs),
+      copyToWorktree(
+        options.copyToWorktree,
+        hostRepoDir,
+        worktreePath,
+        options.timeouts?.copyToWorktreeMs,
+      ),
     );
   }
 
@@ -572,7 +590,11 @@ export const createSandboxFromWorktree = async (
         Effect.flatMap((gitMounts) =>
           Effect.tryPromise({
             try: () =>
-              patchGitMountsForWindows(gitMounts, worktreePath, SANDBOX_REPO_DIR),
+              patchGitMountsForWindows(
+                gitMounts,
+                worktreePath,
+                SANDBOX_REPO_DIR,
+              ),
             catch: (e) =>
               new Error(
                 `Failed to patch git mounts: ${e instanceof Error ? e.message : String(e)}`,
@@ -693,7 +715,12 @@ export const createSandbox = async (
     options.sandbox.tag !== "isolated"
   ) {
     await Effect.runPromise(
-      copyToWorktree(options.copyToWorktree, hostRepoDir, worktreePath, options.timeouts?.copyToWorktreeMs),
+      copyToWorktree(
+        options.copyToWorktree,
+        hostRepoDir,
+        worktreePath,
+        options.timeouts?.copyToWorktreeMs,
+      ),
     );
   }
 
@@ -745,7 +772,11 @@ export const createSandbox = async (
         Effect.flatMap((gitMounts) =>
           Effect.tryPromise({
             try: () =>
-              patchGitMountsForWindows(gitMounts, worktreePath, SANDBOX_REPO_DIR),
+              patchGitMountsForWindows(
+                gitMounts,
+                worktreePath,
+                SANDBOX_REPO_DIR,
+              ),
             catch: (e) =>
               new Error(
                 `Failed to patch git mounts: ${e instanceof Error ? e.message : String(e)}`,

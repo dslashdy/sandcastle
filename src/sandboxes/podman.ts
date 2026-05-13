@@ -251,6 +251,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
             cwd?: string;
             sudo?: boolean;
             stdin?: string;
+            signal?: AbortSignal;
           },
         ): Promise<ExecResult> => {
           const effectiveCommand = opts?.sudo ? `sudo ${command}` : command;
@@ -260,6 +261,11 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
           args.push(containerName, "sh", "-c", effectiveCommand);
 
           return new Promise((resolve, reject) => {
+            if (opts?.signal?.aborted) {
+              reject(opts.signal.reason ?? new Error("podman exec aborted"));
+              return;
+            }
+
             const proc = spawn("podman", args, {
               stdio: [
                 opts?.stdin !== undefined ? "pipe" : "ignore",
@@ -267,6 +273,17 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
                 "pipe",
               ],
             });
+
+            let killTimer: ReturnType<typeof setTimeout> | undefined;
+            const abort = () => {
+              proc.kill("SIGTERM");
+              killTimer = setTimeout(() => {
+                if (proc.exitCode === null && proc.signalCode === null) {
+                  proc.kill("SIGKILL");
+                }
+              }, 2000);
+            };
+            opts?.signal?.addEventListener("abort", abort, { once: true });
 
             if (opts?.stdin !== undefined) {
               proc.stdin!.write(opts.stdin);
@@ -294,10 +311,14 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
             });
 
             proc.on("error", (error) => {
+              opts?.signal?.removeEventListener("abort", abort);
+              if (killTimer) clearTimeout(killTimer);
               reject(new Error(`podman exec failed: ${error.message}`));
             });
 
             proc.on("close", (code) => {
+              opts?.signal?.removeEventListener("abort", abort);
+              if (killTimer) clearTimeout(killTimer);
               resolve({
                 stdout: stdoutChunks.join(opts?.onLine ? "\n" : ""),
                 stderr: stderrChunks.join(""),

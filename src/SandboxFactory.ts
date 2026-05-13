@@ -43,6 +43,7 @@ export interface SandboxService {
       cwd?: string;
       sudo?: boolean;
       stdin?: string;
+      signal?: AbortSignal;
     },
   ) => Effect.Effect<ExecResult, ExecError>;
 
@@ -504,7 +505,12 @@ export const WorktreeDockerSandboxFactory = {
                 (copyPaths && copyPaths.length > 0
                   ? display.spinner(
                       "Copying to worktree",
-                      copyToWorktree(copyPaths, hostRepoDir, worktreeInfo.path, timeouts?.copyToWorktreeMs),
+                      copyToWorktree(
+                        copyPaths,
+                        hostRepoDir,
+                        worktreeInfo.path,
+                        timeouts?.copyToWorktreeMs,
+                      ),
                     )
                   : Effect.succeed(undefined)
                 ).pipe(Effect.map(() => worktreeInfo)),

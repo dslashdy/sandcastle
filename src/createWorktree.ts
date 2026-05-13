@@ -30,7 +30,11 @@ import type {
 import type { CloseResult, Sandbox } from "./createSandbox.js";
 import { createSandboxFromWorktree } from "./createSandbox.js";
 import type { InteractiveResult } from "./interactive.js";
-import { buildLogFilename, printFileDisplayStartup } from "./run.js";
+import {
+  buildLogFilename,
+  buildRawLogFilePath,
+  printFileDisplayStartup,
+} from "./run.js";
 import type { LoggingOption } from "./run.js";
 import { orchestrate, type IterationResult } from "./Orchestrator.js";
 import { defaultSessionPathsLayer } from "./SessionPaths.js";
@@ -165,6 +169,8 @@ export interface WorktreeRunResult {
   readonly branch: string;
   /** Path to the log file, if logging was drained to a file. */
   readonly logFilePath?: string;
+  /** Path to raw agent stdout stream diagnostics, if logging was drained to a file. */
+  readonly rawLogFilePath?: string;
 }
 
 export interface WorktreeCreateSandboxOptions {
@@ -231,7 +237,12 @@ export const createWorktree = async (
       baseBranch,
     });
     if (options.copyToWorktree && options.copyToWorktree.length > 0) {
-      yield* copyToWorktree(options.copyToWorktree, hostRepoDir, info.path, options.timeouts?.copyToWorktreeMs);
+      yield* copyToWorktree(
+        options.copyToWorktree,
+        hostRepoDir,
+        info.path,
+        options.timeouts?.copyToWorktreeMs,
+      );
     }
     // Run host.onWorktreeReady hooks after copyToWorktree, before sandbox creation
     if (options.hooks?.host?.onWorktreeReady?.length) {
@@ -570,12 +581,17 @@ export const createWorktree = async (
           buildLogFilename(worktreeInfo.branch, undefined, opts.name),
         ),
       };
+      const rawLogFilePath =
+        resolvedLogging.type === "file"
+          ? buildRawLogFilePath(resolvedLogging.path)
+          : undefined;
 
       const runDisplayLayer =
         resolvedLogging.type === "file"
           ? (() => {
               printFileDisplayStartup({
                 logPath: resolvedLogging.path,
+                rawLogPath: rawLogFilePath,
                 agentName: opts.name,
                 branch: worktreeInfo.branch,
               });
@@ -632,6 +648,7 @@ export const createWorktree = async (
           resumeSession: opts.resumeSession,
           signal: opts.signal,
           skipPromptExpansion: isInlinePrompt,
+          rawLogFilePath,
         });
       }).pipe(
         Effect.provide(runLayer),
@@ -647,6 +664,7 @@ export const createWorktree = async (
         branch: result.branch,
         logFilePath:
           resolvedLogging.type === "file" ? resolvedLogging.path : undefined,
+        rawLogFilePath,
       } satisfies WorktreeRunResult;
     });
 

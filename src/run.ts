@@ -59,6 +59,7 @@ export const sanitizeBranchForFilename = (branch: string): string =>
 
 export interface FileDisplayStartupOptions {
   readonly logPath: string;
+  readonly rawLogPath?: string;
   readonly agentName?: string;
   readonly branch?: string;
   /** Resolved host repo directory. When it differs from `process.cwd()`, the
@@ -85,6 +86,13 @@ export const printFileDisplayStartup = (
       : options.logPath;
   console.log(`${label} Started${branchPart}`);
   console.log(styleText("dim", `  tail -f ${displayLogPath}`));
+  if (options.rawLogPath) {
+    const displayRawPath =
+      hostRepoDir === process.cwd()
+        ? path.relative(process.cwd(), options.rawLogPath)
+        : options.rawLogPath;
+    console.log(styleText("dim", `  raw stream: ${displayRawPath}`));
+  }
 };
 
 /**
@@ -108,6 +116,13 @@ export const buildLogFilename = (
     return `${sanitizeBranchForFilename(targetBranch)}-${sanitized}${nameSuffix}.log`;
   }
   return `${sanitized}${nameSuffix}.log`;
+};
+
+export const buildRawLogFilePath = (logFilePath: string): string => {
+  if (logFilePath.endsWith(".log")) {
+    return `${logFilePath.slice(0, -4)}.raw.jsonl`;
+  }
+  return `${logFilePath}.raw.jsonl`;
 };
 
 export interface RunSummaryRowsOptions {
@@ -296,6 +311,8 @@ export interface RunResult {
   readonly branch: string;
   /** Path to the log file, if logging was drained to a file. */
   readonly logFilePath?: string;
+  /** Path to raw agent stdout stream diagnostics, if logging was drained to a file. */
+  readonly rawLogFilePath?: string;
   /** Host path to the preserved worktree, set when the run succeeded but the worktree had uncommitted changes. */
   readonly preservedWorktreePath?: string;
 }
@@ -310,7 +327,9 @@ export function run(
 ): Promise<RunResult & { output: string }>;
 /** Overload: without `output`, returns the standard `RunResult`. */
 export function run(options: RunOptions): Promise<RunResult>;
-export async function run(options: RunOptions): Promise<RunResult & { output?: unknown }> {
+export async function run(
+  options: RunOptions,
+): Promise<RunResult & { output?: unknown }> {
   // If signal is already aborted, reject immediately without any setup
   options.signal?.throwIfAborted();
 
@@ -444,11 +463,16 @@ export async function run(options: RunOptions): Promise<RunResult & { output?: u
       buildLogFilename(resolvedBranch, targetBranch, options.name),
     ),
   };
+  const rawLogFilePath =
+    resolvedLogging.type === "file"
+      ? buildRawLogFilePath(resolvedLogging.path)
+      : undefined;
   const displayLayer =
     resolvedLogging.type === "file"
       ? (() => {
           printFileDisplayStartup({
             logPath: resolvedLogging.path,
+            rawLogPath: rawLogFilePath,
             agentName: options.name,
             branch: resolvedBranch,
             hostRepoDir,
@@ -544,6 +568,7 @@ export async function run(options: RunOptions): Promise<RunResult & { output?: u
       resumeSession: options.resumeSession,
       signal: options.signal,
       skipPromptExpansion: isInlinePrompt,
+      rawLogFilePath,
     });
 
     const completion = buildCompletionMessage(
@@ -592,6 +617,7 @@ export async function run(options: RunOptions): Promise<RunResult & { output?: u
     ...result,
     logFilePath:
       resolvedLogging.type === "file" ? resolvedLogging.path : undefined,
+    rawLogFilePath,
   };
 
   // Extract structured output after the iteration completes (separate pass from completion signal)
