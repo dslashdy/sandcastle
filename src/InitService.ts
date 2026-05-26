@@ -411,6 +411,7 @@ export function getNextStepsLines(
     ];
   } else {
     const hasReviewer = template.includes("review");
+    const usesPlanSchema = template.includes("planner");
     let step = 1;
     const lines: string[] = [
       "Next steps:",
@@ -418,8 +419,15 @@ export function getNextStepsLines(
       "   If you want to use your Claude subscription instead of an API key, see https://github.com/mattpocock/sandcastle/issues/191",
       `${step++}. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
       `${step++}. Templates use \`copyToWorktree: ["node_modules"]\` to copy your host node_modules into the sandbox for fast startup — the \`npm install\` in the onSandboxReady hook is a safety net for platform-specific binaries. Adjust both if you use a different package manager`,
-      `${step++}. Read and customize the prompt files in .sandcastle/ — they shape what the agent does`,
     ];
+    if (usesPlanSchema) {
+      lines.push(
+        `${step++}. Install a schema validator for the planner's \`<plan>\` output — the template uses Zod (\`npm install zod\`), but Valibot, ArkType, or any Standard Schema library works (https://standardschema.dev)`,
+      );
+    }
+    lines.push(
+      `${step++}. Read and customize the prompt files in .sandcastle/ — they shape what the agent does`,
+    );
     if (hasReviewer) {
       lines.push(
         `${step++}. Customize .sandcastle/CODING_STANDARDS.md with your project's standards — the reviewer agent loads it during review`,
