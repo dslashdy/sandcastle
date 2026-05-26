@@ -31,6 +31,7 @@ import {
   processFileMountParents,
 } from "../mountUtils.js";
 import { BoundedTail, MAX_TAIL_CHARS } from "../boundedTail.js";
+import { registerShutdown } from "../shutdownRegistry.js";
 
 export interface PodmanOptions {
   /** Podman image name (default: derived from repo directory name). */
@@ -284,8 +285,10 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
         });
       }
 
-      // Set up signal handlers for cleanup
-      const onExit = () => {
+      // Register synchronous container cleanup via the shared shutdown registry
+      // so concurrent sandboxes share a single exit/SIGINT/SIGTERM listener
+      // instead of tripping Node's MaxListenersExceededWarning.
+      const removeContainerSync = () => {
         try {
           execFileSync("podman", ["rm", "-f", containerName], {
             stdio: "ignore",
@@ -295,13 +298,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
           /* best-effort */
         }
       };
-      const onSignal = () => {
-        onExit();
-        process.exit(1);
-      };
-      process.on("exit", onExit);
-      process.on("SIGINT", onSignal);
-      process.on("SIGTERM", onSignal);
+      const unregisterShutdown = registerShutdown(removeContainerSync);
 
       const handle: BindMountSandboxHandle = {
         worktreePath,
@@ -441,9 +438,7 @@ export const podman = (options?: PodmanOptions): SandboxProvider => {
           }),
 
         close: async (): Promise<void> => {
-          process.removeListener("exit", onExit);
-          process.removeListener("SIGINT", onSignal);
-          process.removeListener("SIGTERM", onSignal);
+          unregisterShutdown();
           await new Promise<void>((resolve, reject) => {
             execFile("podman", ["rm", "-f", containerName], (error) => {
               if (error) {

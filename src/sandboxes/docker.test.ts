@@ -756,4 +756,42 @@ describe("docker()", () => {
 
     await handle.close();
   });
+
+  it("shares a single SIGINT listener across many concurrent sandboxes", async () => {
+    mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+      const callback = rest[rest.length - 1];
+      callback(null, "", "");
+      return undefined as any;
+    });
+
+    const sigintBefore = process.listenerCount("SIGINT");
+    const sigtermBefore = process.listenerCount("SIGTERM");
+    const exitBefore = process.listenerCount("exit");
+
+    const provider = docker();
+    const handles: BindMountSandboxHandle[] = [];
+    for (let i = 0; i < 12; i++) {
+      handles.push(
+        (await provider.create({
+          worktreePath: "/tmp/worktree",
+          hostRepoPath: "/tmp/repo",
+          mounts: [
+            { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+          ],
+          env: {},
+        })) as BindMountSandboxHandle,
+      );
+    }
+
+    // 12 sandboxes must not add 12 listeners (which would trip Node's warning).
+    expect(process.listenerCount("SIGINT")).toBe(sigintBefore + 1);
+    expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore + 1);
+    expect(process.listenerCount("exit")).toBe(exitBefore + 1);
+
+    for (const h of handles) await h.close();
+
+    expect(process.listenerCount("SIGINT")).toBe(sigintBefore);
+    expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore);
+    expect(process.listenerCount("exit")).toBe(exitBefore);
+  });
 });
