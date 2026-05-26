@@ -572,7 +572,7 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("@.sandcastle/CODING_STANDARDS.md");
     });
 
-    it("review-prompt.md uses {{SOURCE_BRANCH}} instead of hardcoded main", async () => {
+    it("review-prompt.md diffs against {{TARGET_BRANCH}} (the fork point), not the branch itself", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "sequential-reviewer" });
 
@@ -580,10 +580,43 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "review-prompt.md"),
         "utf-8",
       );
-      expect(prompt).toContain("git diff {{SOURCE_BRANCH}}...{{BRANCH}}");
-      expect(prompt).toContain("git log {{SOURCE_BRANCH}}..{{BRANCH}}");
+      expect(prompt).toContain("git diff {{TARGET_BRANCH}}...{{BRANCH}}");
+      expect(prompt).toContain("git log {{TARGET_BRANCH}}..{{BRANCH}}");
+      // SOURCE_BRANCH equals BRANCH at run time, so diffing against it is
+      // always empty — the prompt must use TARGET_BRANCH instead.
+      expect(prompt).not.toContain("{{SOURCE_BRANCH}}");
       expect(prompt).not.toContain("git diff main");
       expect(prompt).not.toContain("git log main");
+    });
+
+    it("main.mts runs the implementer for a single iteration (one issue per outer pass)", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "sequential-reviewer" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      const implementerSection = mainTs.slice(
+        mainTs.indexOf('name: "implementer"'),
+        mainTs.indexOf('name: "implementer"') + 200,
+      );
+      expect(implementerSection).toContain("maxIterations: 1");
+      expect(implementerSection).not.toContain("maxIterations: 100");
+    });
+
+    it("main.mts stops the loop when the implementer produces no commits", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "sequential-reviewer" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      const noCommitIndex = mainTs.indexOf("!implement.commits.length");
+      const section = mainTs.slice(noCommitIndex, noCommitIndex + 400);
+      expect(section).toContain("break");
+      expect(section).not.toContain("continue");
     });
   });
 
@@ -1209,7 +1242,7 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("@.sandcastle/CODING_STANDARDS.md");
     });
 
-    it("review-prompt.md uses {{SOURCE_BRANCH}} instead of hardcoded main", async () => {
+    it("review-prompt.md diffs against {{TARGET_BRANCH}} (the fork point), not the branch itself", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner-with-review" });
 
@@ -1217,8 +1250,11 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "review-prompt.md"),
         "utf-8",
       );
-      expect(prompt).toContain("git diff {{SOURCE_BRANCH}}...{{BRANCH}}");
-      expect(prompt).toContain("git log {{SOURCE_BRANCH}}..{{BRANCH}}");
+      expect(prompt).toContain("git diff {{TARGET_BRANCH}}...{{BRANCH}}");
+      expect(prompt).toContain("git log {{TARGET_BRANCH}}..{{BRANCH}}");
+      // SOURCE_BRANCH equals BRANCH at run time, so diffing against it is
+      // always empty — the prompt must use TARGET_BRANCH instead.
+      expect(prompt).not.toContain("{{SOURCE_BRANCH}}");
       expect(prompt).not.toContain("git diff main");
       expect(prompt).not.toContain("git log main");
     });
