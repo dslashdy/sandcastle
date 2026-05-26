@@ -157,6 +157,9 @@ const result = await run({
     // Optional: add the container user to supplementary groups via --group-add.
     // Accepts group names or numeric GIDs (e.g. for a bind-mounted Docker socket).
     groups: ["docker", 999],
+    // Optional: expose host devices via --device. Each entry is a full device
+    // spec in host[:container[:permissions]] form (e.g. "/dev/kvm").
+    devices: ["/dev/kvm"],
   }),
 
   // Host repo directory — replaces process.cwd() as the anchor for

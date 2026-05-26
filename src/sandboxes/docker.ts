@@ -87,6 +87,18 @@ export interface DockerOptions {
    * When omitted, no `--group-add` flags are added.
    */
   readonly groups?: readonly (string | number)[];
+  /**
+   * Host devices to expose to the container, via `--device`.
+   *
+   * Each entry is a full device spec in `host[:container[:permissions]]` form:
+   *
+   * - `["/dev/kvm"]` → `--device /dev/kvm`
+   * - `["/dev/sda:/dev/xvda:rwm"]` → `--device /dev/sda:/dev/xvda:rwm`
+   * - `["/dev/kvm", "/dev/fuse"]` → `--device /dev/kvm --device /dev/fuse`
+   *
+   * When omitted, no `--device` flags are added.
+   */
+  readonly devices?: readonly string[];
 }
 
 /**
@@ -156,6 +168,7 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
             user: `${containerUid}:${containerGid}`,
             network: options?.network,
             groups: options?.groups,
+            devices: options?.devices,
             selinuxLabel,
           },
         ),
