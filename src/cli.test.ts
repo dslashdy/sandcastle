@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -186,5 +186,110 @@ describe("sandcastle CLI", () => {
       expect(output).toContain("nonexistent");
       expect(output).toContain("claude-code");
     }
+  });
+
+  it("init --help exposes --issue-tracker flag", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--issue-tracker");
+  });
+
+  it("init --help exposes --create-label flag", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--create-label");
+  });
+
+  it("init --help exposes --build-image flag", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--build-image");
+  });
+
+  it("init --help exposes --install-template-deps flag", async () => {
+    const { stdout } = await runCli("init --help", process.cwd());
+    expect(stdout).toContain("--install-template-deps");
+  });
+
+  it("init --issue-tracker nonexistent produces error listing available trackers", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli("init --issue-tracker nonexistent", hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("nonexistent");
+      expect(output).toContain("github-issues");
+      expect(output).toContain("beads");
+      expect(output).toContain("custom");
+    }
+  });
+
+  it("init with full flag set scaffolds non-interactively in a non-TTY env", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // vitest workers have no TTY, so this confirms the fully-non-interactive
+    // path runs to completion without clack crashing on a missing prompt.
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker beads --build-image false",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Init complete");
+    const entries = await readdir(join(hostDir, ".sandcastle"));
+    expect(entries).toContain("Dockerfile");
+    expect(entries).toContain("prompt.md");
+  });
+
+  it("init without --agent fails fast with a clear non-interactive error message", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli("init --template blank --sandbox docker", hostDir);
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("--agent");
+      expect(output).toContain("non-interactive");
+    }
+  });
+
+  it("init --issue-tracker github-issues without --create-label fails fast in non-interactive mode", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    try {
+      await runCli(
+        "init --agent claude-code --template blank --sandbox docker --issue-tracker github-issues",
+        hostDir,
+      );
+      expect.fail("Expected command to fail");
+    } catch (err: unknown) {
+      const { stdout, stderr } = err as { stdout: string; stderr: string };
+      const output = stdout + stderr;
+      expect(output).toContain("--create-label");
+      expect(output).toContain("non-interactive");
+    }
+  });
+
+  it("init --issue-tracker custom ignores --build-image and scaffolds without trying to build", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "cli-host-"));
+    await initRepo(hostDir);
+
+    // --build-image is meaningless for the custom tracker (Dockerfile is
+    // deliberately broken until configured) and must be silently ignored
+    // rather than fail-fast or attempt a build.
+    const { stdout } = await runCli(
+      "init --agent claude-code --template blank --sandbox docker --issue-tracker custom --build-image true",
+      hostDir,
+    );
+
+    expect(stdout).toContain("Init complete");
+    const entries = await readdir(join(hostDir, ".sandcastle"));
+    expect(entries).toContain("SETUP_ISSUE_TRACKER.md");
   });
 });
