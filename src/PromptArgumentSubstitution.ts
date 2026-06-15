@@ -77,7 +77,7 @@ export const findMissingPromptArgKeys = (
     if (seen.has(key)) continue;
     seen.add(key);
     if (builtInSet.has(key)) continue;
-    if (key in providedArgs) continue;
+    if (key in providedArgs && providedArgs[key] != null) continue;
     missing.push(key);
   }
 
@@ -115,12 +115,22 @@ export const substitutePromptArgs = (
     // Collect all keys referenced in the prompt
     const referencedKeys = new Set(matches.map((m) => m[1]!));
 
-    // Check for missing keys (placeholder in prompt but no matching arg)
+    // Check for missing keys (placeholder in prompt but no matching arg, or
+    // a present-but-nullish value supplied by an untyped caller — e.g. an
+    // orchestrator building args from JSON.parse).
     for (const key of referencedKeys) {
       if (!(key in sanitizedArgs)) {
         return yield* Effect.fail(
           new PromptError({
             message: `Prompt argument "{{${key}}}" has no matching value in promptArgs`,
+          }),
+        );
+      }
+      const value = sanitizedArgs[key];
+      if (value == null) {
+        return yield* Effect.fail(
+          new PromptError({
+            message: `Prompt argument "{{${key}}}" has value ${value === null ? "null" : "undefined"} in promptArgs`,
           }),
         );
       }
