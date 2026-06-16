@@ -1,5 +1,16 @@
 # @ai-hero/sandcastle
 
+## 0.9.0
+
+### Minor Changes
+
+- 47184de: Capture Claude Code subagent / workflow session transcripts to the host alongside the main session. Previously only the main `<sessionId>.jsonl` was copied off the sandbox; transcripts written by the `Agent` tool and the `Workflow` tool under `<sessionId>/subagents/agent-*.jsonl` were lost on teardown. They are now captured with the same sandbox→host `cwd` rewrite. Failure to capture an individual subagent transcript is best-effort and logs a warning; the main session capture remains fatal on failure.
+
+### Patch Changes
+
+- 86aec83: `sandcastle init` now scaffolds `CLAUDE_CODE_OAUTH_TOKEN=` (with a commented `ANTHROPIC_API_KEY=` fallback) for the Claude Code agent, and the next-steps copy points users at `claude setup-token` instead of the closed issue #191.
+- 03dcc25: Guard `substitutePromptArgs` against `undefined`/`null` values in `promptArgs`. Previously, a present-but-nullish value (e.g. `{ TITLE: undefined }` from an orchestrator's `JSON.parse` output) bypassed the existence check and crashed with an unguarded `TypeError` on `.toString()`. Now surfaces a clean `PromptError` naming the offending key. `findMissingPromptArgKeys` also treats present-but-nullish values as missing, so the interactive prompt-fill flow asks the user to supply the value rather than failing through.
+
 ## 0.8.0
 
 ### Minor Changes
