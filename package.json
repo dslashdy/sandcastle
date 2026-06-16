@@ -1,6 +1,6 @@
 {
   "name": "@ai-hero/sandcastle",
-  "version": "0.5.10",
+  "version": "0.9.0",
   "description": "CLI for orchestrating AI agents in isolated sandbox environments",
   "type": "module",
   "main": "./dist/index.js",
@@ -39,14 +39,14 @@
     "sandcastle": "dist/main.js"
   },
   "scripts": {
-    "build": "tsgo --project tsconfig.build.json",
-    "postbuild": "rm -rf dist/templates && cp -r src/templates dist/templates",
+    "build": "tsup",
+    "postbuild": "rm -rf dist/templates && cp -r src/templates dist/templates && node scripts/check-public-types-effect-free.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsgo --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepare": "npm run build && (husky || true)",
+    "prepare": "husky",
     "release": "changeset publish",
     "sandcastle": "npm run build && tsx .sandcastle/run.ts",
     "test-sbx-claude": "npm run build && tsx .sandcastle/test-sbx-claude.ts",
@@ -71,27 +71,29 @@
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
     "@daytona/sdk": "^0.164.0",
-    "@effect/vitest": "^0.28.0",
-    "@types/node": "^25.5.0",
-    "@typescript/native-preview": "^7.0.0-dev.20260317.1",
-    "husky": "^9.1.7",
-    "lint-staged": "^15.5.1",
-    "prettier": "^3.5.3",
-    "tsx": "^4.21.0",
-    "vitest": "^3.2.0"
-  },
-  "dependencies": {
-    "@clack/prompts": "^1.1.0",
     "@effect/cli": "^0.74.0",
     "@effect/platform": "^0.95.0",
     "@effect/platform-node": "^0.105.0",
     "@effect/printer": "^0.48.0",
     "@effect/printer-ansi": "^0.48.0",
-    "effect": "^3.20.0"
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "^7.0.0-dev.20260317.1",
+    "effect": "^3.20.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.1",
+    "prettier": "^3.5.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.0",
+    "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.1.0"
   },
   "peerDependencies": {
-    "@vercel/sandbox": ">=1.0.0",
-    "@daytona/sdk": "^0.164.0"
+    "@daytona/sdk": "^0.164.0",
+    "@vercel/sandbox": ">=1.0.0"
   },
   "peerDependenciesMeta": {
     "@vercel/sandbox": {
@@ -100,9 +102,6 @@
     "@daytona/sdk": {
       "optional": true
     }
-  },
-  "lint-staged": {
-    "*.{ts,tsx,js,jsx,json,md}": "prettier --write"
   },
   "files": [
     "dist"

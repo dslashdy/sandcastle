@@ -15,7 +15,9 @@
     "declarationMap": true,
     "sourceMap": true,
     "noUncheckedIndexedAccess": true,
-    "noEmitOnError": true
+    "noEmitOnError": true,
+    "ignoreDeprecations": "6.0",
+    "stripInternal": true
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]

@@ -1,9 +1,9 @@
 import { NodeContext, NodeFileSystem } from "@effect/platform-node";
-import { existsSync } from "node:fs";
 import path, { join } from "node:path";
 import { styleText } from "node:util";
 import { Effect, Layer } from "effect";
 import { resolveCwd } from "./resolveCwd.js";
+import { assertResumeSessionExists } from "./resumePrecheck.js";
 import type { AgentProvider } from "./AgentProvider.js";
 import {
   ClackDisplay,
@@ -27,14 +27,11 @@ import { resolveEnv } from "./EnvResolver.js";
 import { formatErrorMessage } from "./ErrorHandler.js";
 import type { SandboxError } from "./errors.js";
 import {
-  callbackAgentStreamEmitterLayer,
-  noopAgentStreamEmitterLayer,
+  agentStreamEmitterLayer,
   type AgentStreamEvent,
 } from "./AgentStreamEmitter.js";
 import type { SandboxHooks } from "./SandboxLifecycle.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
-import { hostSessionStore } from "./SessionStore.js";
-import { defaultSessionPathsLayer } from "./SessionPaths.js";
 import { generateTempBranchName, getCurrentBranch } from "./WorktreeManager.js";
 import {
   type PromptArgs,
@@ -59,7 +56,6 @@ export const sanitizeBranchForFilename = (branch: string): string =>
 
 export interface FileDisplayStartupOptions {
   readonly logPath: string;
-  readonly rawLogPath?: string;
   readonly agentName?: string;
   readonly branch?: string;
   /** Resolved host repo directory. When it differs from `process.cwd()`, the
@@ -86,13 +82,6 @@ export const printFileDisplayStartup = (
       : options.logPath;
   console.log(`${label} Started${branchPart}`);
   console.log(styleText("dim", `  tail -f ${displayLogPath}`));
-  if (options.rawLogPath) {
-    const displayRawPath =
-      hostRepoDir === process.cwd()
-        ? path.relative(process.cwd(), options.rawLogPath)
-        : options.rawLogPath;
-    console.log(styleText("dim", `  raw stream: ${displayRawPath}`));
-  }
 };
 
 /**
@@ -116,13 +105,6 @@ export const buildLogFilename = (
     return `${sanitizeBranchForFilename(targetBranch)}-${sanitized}${nameSuffix}.log`;
   }
   return `${sanitized}${nameSuffix}.log`;
-};
-
-export const buildRawLogFilePath = (logFilePath: string): string => {
-  if (logFilePath.endsWith(".log")) {
-    return `${logFilePath.slice(0, -4)}.raw.jsonl`;
-  }
-  return `${logFilePath}.raw.jsonl`;
 };
 
 export interface RunSummaryRowsOptions {
@@ -217,11 +199,17 @@ export type LoggingOption =
 export interface Timeouts {
   /** Timeout (ms) for the host-side copy of `copyToWorktree` paths into the worktree. Default: 60_000. */
   readonly copyToWorktreeMs?: number;
+  /** Timeout (ms) for each in-sandbox git setup command (safe.directory, user.name/email, branch discovery). Default: 10_000. */
+  readonly gitSetupMs?: number;
+  /** Timeout (ms) for collecting the commits produced during the run. Default: 30_000. */
+  readonly commitCollectionMs?: number;
+  /** Timeout (ms) for merging the temp branch back to the host branch (merge-to-head strategy). Default: 30_000. */
+  readonly mergeToHostMs?: number;
 }
 
-export interface RunOptions {
+export interface RunOptions<A extends AgentProvider = AgentProvider> {
   /** Agent provider to use (e.g. claudeCode("claude-opus-4-7")) */
-  readonly agent: AgentProvider;
+  readonly agent: A;
   /** Sandbox provider (e.g. docker({ imageName: "sandcastle:myrepo" })). */
   readonly sandbox: SandboxProvider;
   /**
@@ -256,6 +244,17 @@ export interface RunOptions {
   readonly completionSignal?: string | string[];
   /** Idle timeout in seconds. If the agent produces no output for this long, it fails. Default: 600 (10 minutes) */
   readonly idleTimeoutSeconds?: number;
+  /**
+   * Grace window in seconds after a completion signal is observed in the
+   * agent's output. The agent process is expected to exit shortly after
+   * emitting the signal; if it does not (typically because a spawned child —
+   * a `gh`/git subprocess or long-lived MCP server — keeps stdout open),
+   * Sandcastle force-completes the iteration with a warning. Resets on every
+   * subsequent output line so trailing data (token-usage events, terminal
+   * `result` events, structured-output tags) is still captured. Independent
+   * of `idleTimeoutSeconds`. Default: 60.
+   */
+  readonly completionTimeoutSeconds?: number;
   /** Optional name for the run, shown as a prefix in log output */
   readonly name?: string;
   /** Paths relative to the host repo root to copy into the worktree before sandbox start. */
@@ -265,6 +264,15 @@ export interface RunOptions {
   readonly branchStrategy?: BranchStrategy;
   /** Resume a prior Claude Code session by ID. The session JSONL must exist on the host. Incompatible with maxIterations > 1. */
   readonly resumeSession?: string;
+  /**
+   * When true alongside `resumeSession`, fork the session instead of mutating
+   * it. The parent session JSONL is left intact and the agent writes a new
+   * session under a fresh id. Exposed as the public `.fork()` method on
+   * `RunResult` rather than as a stand-alone caller option — see ADR 0018.
+   *
+   * @internal
+   */
+  readonly forkSession?: boolean;
   /**
    * An `AbortSignal` that cancels the run when aborted.
    *
@@ -298,6 +306,17 @@ export interface RunOptions {
 
 export type { IterationResult, IterationUsage } from "./Orchestrator.js";
 
+export type ResumeRunResultOptions = Omit<
+  RunOptions,
+  | "agent"
+  | "sandbox"
+  | "prompt"
+  | "promptFile"
+  | "resumeSession"
+  | "forkSession"
+  | "maxIterations"
+>;
+
 export interface RunResult {
   /** Per-iteration results (use `iterations.length` for the count). */
   readonly iterations: IterationResult[];
@@ -311,22 +330,44 @@ export interface RunResult {
   readonly branch: string;
   /** Path to the log file, if logging was drained to a file. */
   readonly logFilePath?: string;
-  /** Path to raw agent stdout stream diagnostics, if logging was drained to a file. */
-  readonly rawLogFilePath?: string;
   /** Host path to the preserved worktree, set when the run succeeded but the worktree had uncommitted changes. */
   readonly preservedWorktreePath?: string;
+  /** Continue the last captured agent session for exactly one iteration.
+   *  Present only when the provider supports resume (`sessionStorage` populated). */
+  readonly resume?: (
+    prompt: string,
+    options?: ResumeRunResultOptions,
+  ) => Promise<RunResult>;
+  /**
+   * Fork the last captured agent session for exactly one iteration: the
+   * parent session JSONL is left intact and the child run gets its own
+   * session id, enabling fan-out patterns where multiple children diverge
+   * from a single parent. Present only when the provider supports resume
+   * (`sessionStorage` populated).
+   *
+   * Sessions only: fork isolates the agent session, not the branch or
+   * sandbox. Safe concurrent fan-out (`Promise.all([r.fork(a), r.fork(b)])`)
+   * requires the caller to give each fork a distinct `branch` — `head` and
+   * `merge-to-head` are not safe for concurrent forks. See ADR 0018.
+   */
+  readonly fork?: (
+    prompt: string,
+    options?: ResumeRunResultOptions,
+  ) => Promise<RunResult>;
 }
 
 /** Overload: with `Output.object`, returns `RunResult` with typed `output: T`. */
-export function run<T>(
-  options: RunOptions & { output: OutputObjectDefinition<T> },
+export function run<T, A extends AgentProvider>(
+  options: RunOptions<A> & { output: OutputObjectDefinition<T> },
 ): Promise<RunResult & { output: T }>;
 /** Overload: with `Output.string`, returns `RunResult` with `output: string`. */
-export function run(
-  options: RunOptions & { output: OutputStringDefinition },
+export function run<A extends AgentProvider>(
+  options: RunOptions<A> & { output: OutputStringDefinition },
 ): Promise<RunResult & { output: string }>;
 /** Overload: without `output`, returns the standard `RunResult`. */
-export function run(options: RunOptions): Promise<RunResult>;
+export function run<A extends AgentProvider>(
+  options: RunOptions<A>,
+): Promise<RunResult>;
 export async function run(
   options: RunOptions,
 ): Promise<RunResult & { output?: unknown }> {
@@ -376,6 +417,15 @@ export async function run(
     );
   }
 
+  // Validate: forkSession only makes sense alongside resumeSession.
+  // It is wired internally by RunResult.fork() and never set on its own.
+  if (options.forkSession && !options.resumeSession) {
+    throw new Error(
+      "forkSession requires resumeSession. " +
+        "Use RunResult.fork(prompt) to fork the last captured session.",
+    );
+  }
+
   // Validate: output requires maxIterations === 1
   if (options.output && maxIterations !== 1) {
     throw new Error(
@@ -394,13 +444,12 @@ export async function run(
 
   // Validate: resumeSession file must exist on the host
   if (options.resumeSession) {
-    const hStore = hostSessionStore(hostRepoDir);
-    const sessionPath = hStore.sessionFilePath(options.resumeSession);
-    if (!existsSync(sessionPath)) {
-      throw new Error(
-        `resumeSession "${options.resumeSession}" not found: expected session file at ${sessionPath}`,
-      );
-    }
+    await assertResumeSessionExists({
+      provider,
+      sandboxTag: options.sandbox.tag,
+      hostRepoDir,
+      resumeSession: options.resumeSession,
+    });
   }
 
   // Resolve prompt
@@ -463,16 +512,11 @@ export async function run(
       buildLogFilename(resolvedBranch, targetBranch, options.name),
     ),
   };
-  const rawLogFilePath =
-    resolvedLogging.type === "file"
-      ? buildRawLogFilePath(resolvedLogging.path)
-      : undefined;
   const displayLayer =
     resolvedLogging.type === "file"
       ? (() => {
           printFileDisplayStartup({
             logPath: resolvedLogging.path,
-            rawLogPath: rawLogFilePath,
             agentName: options.name,
             branch: resolvedBranch,
             hostRepoDir,
@@ -503,16 +547,16 @@ export async function run(
     ),
   );
 
-  const agentStreamEmitterLayer =
-    resolvedLogging.type === "file" && resolvedLogging.onAgentStreamEvent
-      ? callbackAgentStreamEmitterLayer(resolvedLogging.onAgentStreamEvent)
-      : noopAgentStreamEmitterLayer;
+  const streamEmitterLayer = agentStreamEmitterLayer(
+    resolvedLogging.type === "file"
+      ? resolvedLogging.onAgentStreamEvent
+      : undefined,
+  );
 
   const runLayer = Layer.mergeAll(
     factoryLayer,
     displayLayer,
-    defaultSessionPathsLayer,
-    agentStreamEmitterLayer,
+    streamEmitterLayer,
   );
 
   const baseEffect = Effect.gen(function* () {
@@ -564,11 +608,13 @@ export async function run(
       provider,
       completionSignal: options.completionSignal,
       idleTimeoutSeconds: options.idleTimeoutSeconds,
+      completionTimeoutSeconds: options.completionTimeoutSeconds,
       name: options.name,
       resumeSession: options.resumeSession,
+      forkSession: options.forkSession,
       signal: options.signal,
       skipPromptExpansion: isInlinePrompt,
-      rawLogFilePath,
+      timeouts: options.timeouts,
     });
 
     const completion = buildCompletionMessage(
@@ -617,11 +663,49 @@ export async function run(
     ...result,
     logFilePath:
       resolvedLogging.type === "file" ? resolvedLogging.path : undefined,
-    rawLogFilePath,
+    resume: async (
+      prompt: string,
+      resumeOptions?: ResumeRunResultOptions,
+    ): Promise<RunResult> => {
+      const lastIteration = result.iterations.at(-1);
+      if (!lastIteration?.sessionId) {
+        throw new Error("Cannot resume: no sessionId was captured");
+      }
+      return run({
+        ...options,
+        ...resumeOptions,
+        prompt,
+        promptFile: undefined,
+        maxIterations: 1,
+        resumeSession: lastIteration.sessionId,
+      });
+    },
+    fork: async (
+      prompt: string,
+      forkOptions?: ResumeRunResultOptions,
+    ): Promise<RunResult> => {
+      const lastIteration = result.iterations.at(-1);
+      if (!lastIteration?.sessionId) {
+        throw new Error("Cannot fork: no sessionId was captured");
+      }
+      return run({
+        ...options,
+        ...forkOptions,
+        prompt,
+        promptFile: undefined,
+        maxIterations: 1,
+        resumeSession: lastIteration.sessionId,
+        forkSession: true,
+      });
+    },
   };
 
   // Extract structured output after the iteration completes (separate pass from completion signal)
   if (options.output) {
+    // Structured output runs are single-iteration, so the last iteration is the
+    // one that produced this stdout. Carry its session id onto the error so a
+    // caller can resume the same session to re-emit corrected output.
+    const lastIteration = baseResult.iterations.at(-1);
     const output = await extractStructuredOutput(
       baseResult.stdout,
       options.output,
@@ -629,6 +713,8 @@ export async function run(
         commits: baseResult.commits,
         branch: baseResult.branch,
         preservedWorktreePath: baseResult.preservedWorktreePath,
+        sessionId: lastIteration?.sessionId,
+        sessionFilePath: lastIteration?.sessionFilePath,
       },
     );
     return { ...baseResult, output };

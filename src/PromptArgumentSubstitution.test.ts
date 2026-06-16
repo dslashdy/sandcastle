@@ -84,6 +84,32 @@ describe("PromptArgumentSubstitution", () => {
     expect(error.message).toContain("MISSING");
   });
 
+  it("throws PromptError when a placeholder value is undefined", async () => {
+    const { layer } = setup();
+    const error = await runFail(
+      "Hello {{TITLE}}",
+      { TITLE: undefined } as unknown as Record<string, string>,
+      layer,
+    );
+    expect(error).toBeInstanceOf(PromptError);
+    expect(error._tag).toBe("PromptError");
+    expect(error.message).toContain("{{TITLE}}");
+    expect(error.message).toContain("undefined");
+  });
+
+  it("throws PromptError when a placeholder value is null", async () => {
+    const { layer } = setup();
+    const error = await runFail(
+      "Hello {{TITLE}}",
+      { TITLE: null } as unknown as Record<string, string>,
+      layer,
+    );
+    expect(error).toBeInstanceOf(PromptError);
+    expect(error._tag).toBe("PromptError");
+    expect(error.message).toContain("{{TITLE}}");
+    expect(error.message).toContain("null");
+  });
+
   it("logs a warning for unused prompt args", async () => {
     const { layer, displayRef } = setup();
     await run("Hello world", { UNUSED: "value" }, layer);
@@ -328,5 +354,19 @@ describe("findMissingPromptArgKeys", () => {
       PROVIDED: "value",
     });
     expect(result).toEqual(["MISSING"]);
+  });
+
+  it("treats a key with an undefined value as missing", () => {
+    const result = findMissingPromptArgKeys("Fix {{COMPONENT}}", {
+      COMPONENT: undefined,
+    } as unknown as Record<string, string>);
+    expect(result).toEqual(["COMPONENT"]);
+  });
+
+  it("treats a key with a null value as missing", () => {
+    const result = findMissingPromptArgKeys("Fix {{COMPONENT}}", {
+      COMPONENT: null,
+    } as unknown as Record<string, string>);
+    expect(result).toEqual(["COMPONENT"]);
   });
 });

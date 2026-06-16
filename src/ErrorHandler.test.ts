@@ -12,6 +12,7 @@ import {
   ExecHostError,
   InitError,
   PromptError,
+  PromptExpansionTimeoutError,
   SyncError,
   WorktreeError,
 } from "./errors.js";
@@ -70,6 +71,29 @@ describe("formatErrorMessage", () => {
     );
     expect(msg).toContain("Failed to resolve prompt");
     expect(msg).toContain("file not found");
+  });
+
+  it("PromptError surfaces exitCode when set", () => {
+    const msg = formatErrorMessage(
+      new PromptError({
+        message: "Command `gh api ...` exited with code 4: bad credentials",
+        exitCode: 4,
+      }),
+    );
+    expect(msg).toContain("code 4");
+  });
+
+  it("PromptExpansionTimeoutError surfaces elapsedMs", () => {
+    const msg = formatErrorMessage(
+      new PromptExpansionTimeoutError({
+        message: "Shell expression `gh api ...` timed out after 30142ms",
+        timeoutMs: 30_000,
+        expression: "gh api ...",
+        elapsedMs: 30_142,
+      }),
+    );
+    expect(msg).toContain("30142");
+    expect(msg).toContain("timed out");
   });
 
   it("AgentError includes message", () => {

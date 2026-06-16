@@ -1,4 +1,4 @@
-import { Effect, Layer } from "effect";
+import { Effect } from "effect";
 import { existsSync } from "node:fs";
 import { join, posix } from "node:path";
 import {
@@ -16,11 +16,13 @@ import type {
   BindMountSandboxHandle,
   IsolatedSandboxProvider,
   IsolatedSandboxHandle,
+  NoSandboxProvider,
+  NoSandboxHandle,
 } from "./SandboxProvider.js";
 import {
-  type Sandbox,
+  type SandboxService,
   type MountEntry,
-  makeSandboxLayerFromHandle,
+  makeSandboxFromHandle,
   SANDBOX_REPO_DIR,
 } from "./SandboxFactory.js";
 import { syncIn } from "./syncIn.js";
@@ -46,13 +48,25 @@ export interface StartSandboxIsolatedOptions {
   copyPaths?: string[];
 }
 
+export interface StartSandboxNoSandboxOptions {
+  provider: NoSandboxProvider;
+  hostRepoDir: string;
+  env: Record<string, string>;
+  /** Host-side worktree path the agent will run in. Equal to hostRepoDir in head mode. */
+  worktreeOrRepoPath: string;
+  gitMounts?: undefined;
+  repoDir?: undefined;
+  copyPaths?: undefined;
+}
+
 export type StartSandboxOptions =
   | StartSandboxBindMountOptions
-  | StartSandboxIsolatedOptions;
+  | StartSandboxIsolatedOptions
+  | StartSandboxNoSandboxOptions;
 
 export interface StartSandboxResult {
-  handle: BindMountSandboxHandle | IsolatedSandboxHandle;
-  sandboxLayer: Layer.Layer<Sandbox>;
+  handle: BindMountSandboxHandle | IsolatedSandboxHandle | NoSandboxHandle;
+  sandbox: SandboxService;
   worktreePath: string;
 }
 
@@ -83,8 +97,32 @@ export const startSandbox = (
   if (options.provider.tag === "bind-mount") {
     return startBindMountSandbox(options as StartSandboxBindMountOptions);
   }
+  if (options.provider.tag === "none") {
+    return startNoSandbox(options as StartSandboxNoSandboxOptions);
+  }
   return startIsolatedSandbox(options as StartSandboxIsolatedOptions);
 };
+
+const startNoSandbox = (
+  options: StartSandboxNoSandboxOptions,
+): Effect.Effect<StartSandboxResult, WorktreeError> =>
+  Effect.tryPromise({
+    try: () =>
+      options.provider.create({
+        worktreePath: options.worktreeOrRepoPath,
+        env: options.env,
+      }),
+    catch: (e) =>
+      new WorktreeError({
+        message: `Provider '${options.provider.name}' create failed: ${e instanceof Error ? e.message : String(e)}`,
+      }),
+  }).pipe(
+    Effect.map((handle) => ({
+      handle,
+      sandbox: makeSandboxFromHandle(handle),
+      worktreePath: handle.worktreePath,
+    })),
+  );
 
 const startBindMountSandbox = (
   options: StartSandboxBindMountOptions,
@@ -124,7 +162,7 @@ const startBindMountSandbox = (
   }).pipe(
     Effect.map((handle) => ({
       handle,
-      sandboxLayer: makeSandboxLayerFromHandle(handle),
+      sandbox: makeSandboxFromHandle(handle),
       worktreePath: handle.worktreePath,
     })),
     withTimeout(
@@ -211,7 +249,7 @@ const startIsolatedSandbox = (
 
     return {
       handle,
-      sandboxLayer: makeSandboxLayerFromHandle(handle),
+      sandbox: makeSandboxFromHandle(handle),
       worktreePath: handle.worktreePath,
     };
   });

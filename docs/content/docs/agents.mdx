@@ -17,16 +17,22 @@ An agent provider defines how Sandcastle interacts with a specific AI coding too
 
 The default agent provider. Uses Claude Code as the AI coding agent inside the sandbox.
 
-Required environment variables:
+Required environment variables (one of):
 
 | Variable | Description |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code OAuth token — get one by running `claude setup-token` on your host. Lets the agent use your Claude subscription instead of an API key. |
+| `ANTHROPIC_API_KEY` | Anthropic API key (alternative to `CLAUDE_CODE_OAUTH_TOKEN`) |
+
+Plus:
+
+| Variable | Description |
+| --- | --- |
 | `GH_TOKEN` | GitHub personal access token |
 
 ### OpenCode
 
-Uses OpenCode as the AI coding agent. OpenCode output is passed through as raw stdout (no JSON parsing).
+Uses OpenCode as the AI coding agent. Sandcastle runs it with `--format json` and parses the structured event stream to surface live text, tool calls, and the session ID.
 
 Required environment variables:
 

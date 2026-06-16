@@ -1,7 +1,9 @@
 import { Effect, Option } from "effect";
 import { FileSystem } from "@effect/platform";
 import { execFile } from "node:child_process";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { join, normalize } from "node:path";
 import { WorktreeError, WorktreeTimeoutError, withTimeout } from "./errors.js";
 
 const WORKTREE_TIMEOUT_MS = 30_000;
@@ -28,6 +30,14 @@ const formatTimestamp = (date: Date): string => {
   );
 };
 
+/**
+ * Short random hex suffix appended to generated temp branch names. Three
+ * bytes (six hex chars) is enough entropy to keep concurrent `run()` /
+ * `RunResult.fork()` calls within the same second from colliding on branch
+ * names — the second-granularity timestamp alone is not (see ADR 0018).
+ */
+const randomBranchSuffix = (): string => randomBytes(3).toString("hex");
+
 /** Sanitize a name for use in branch names and directory names. */
 export const sanitizeName = (name: string): string =>
   name.toLowerCase().replace(/[^a-z0-9]/g, "-");
@@ -37,32 +47,46 @@ const execGit = (
   cwd: string,
 ): Effect.Effect<string, WorktreeError> =>
   Effect.async((resume) => {
-    execFile("git", args, { cwd }, (error, stdout, stderr) => {
-      if (error) {
-        resume(
-          Effect.fail(
-            new WorktreeError({
-              message: stderr?.trim() || error.message,
-            }),
-          ),
-        );
-      } else {
-        resume(Effect.succeed(stdout));
-      }
-    });
+    // Force the C locale so git emits English, machine-stable messages. Several
+    // callers match git's stderr (e.g. "invalid reference") to decide control
+    // flow; under a localized locale gettext translates those strings and the
+    // matches silently fail, breaking worktree creation (issue #595).
+    execFile(
+      "git",
+      args,
+      { cwd, env: { ...process.env, LC_ALL: "C" } },
+      (error, stdout, stderr) => {
+        if (error) {
+          resume(
+            Effect.fail(
+              new WorktreeError({
+                message: stderr?.trim() || error.message,
+              }),
+            ),
+          );
+        } else {
+          resume(Effect.succeed(stdout));
+        }
+      },
+    );
   });
 
 /**
  * Generates a temporary branch name.
- * When name is provided: `sandcastle/<sanitized-name>/<YYYYMMDD-HHMMSS>`.
- * Otherwise: `sandcastle/<YYYYMMDD-HHMMSS>`.
+ * When name is provided: `sandcastle/<sanitized-name>/<YYYYMMDD-HHMMSS>-<random>`.
+ * Otherwise: `sandcastle/<YYYYMMDD-HHMMSS>-<random>`.
+ *
+ * The random suffix prevents collisions between concurrent calls within the
+ * same wall-clock second — relevant for fan-out via `RunResult.fork()` and
+ * for plain `Promise.all([run(), run()])` callers.
  */
 export const generateTempBranchName = (name?: string): string => {
   const ts = formatTimestamp(new Date());
+  const suffix = randomBranchSuffix();
   if (name) {
-    return `sandcastle/${sanitizeName(name)}/${ts}`;
+    return `sandcastle/${sanitizeName(name)}/${ts}-${suffix}`;
   }
-  return `sandcastle/${ts}`;
+  return `sandcastle/${ts}-${suffix}`;
 };
 
 /** Returns the name of the currently checked-out branch in the given repo directory. */
@@ -78,10 +102,74 @@ export interface WorktreeInfo {
   branch: string;
 }
 
-interface WorktreeEntry {
+/** A single entry parsed from `git worktree list --porcelain`. */
+export interface WorktreeEntry {
   path: string;
+  /** `null` for a detached HEAD (e.g. mid-rebase). */
   branch: string | null;
 }
+
+/**
+ * Normalizes path separators to forward slashes.
+ *
+ * `git worktree list --porcelain` reports paths with forward slashes on every
+ * platform, but `node:path.join` produces backslashes on Windows. Comparing
+ * the two without normalizing fails on Windows, so all path comparisons in
+ * this module run both sides through this first.
+ */
+const normalizePath = (p: string): string => {
+  let path = p;
+  try {
+    path = realpathSync.native(p);
+  } catch {
+    // Non-existent paths still need string comparison, especially in unit tests
+    // and before `git worktree add` has created the target directory.
+  }
+  return path.replace(/\\/g, "/");
+};
+
+/**
+ * Finds an existing worktree that collides with `branch` or `worktreePath`.
+ *
+ * Matches by branch first, then falls back to a path match — covering the
+ * mid-rebase detached-HEAD case where git reports a `null` branch. The path
+ * fallback normalizes separators so it works on Windows.
+ */
+export const findCollidingWorktree = (
+  existing: readonly WorktreeEntry[],
+  branch: string,
+  worktreePath: string,
+): WorktreeEntry | undefined =>
+  existing.find((wt) => wt.branch === branch) ??
+  existing.find((wt) => normalizePath(wt.path) === normalizePath(worktreePath));
+
+/**
+ * Whether `worktreePath` lives under `worktreesDir` (i.e. is a worktree managed
+ * by sandcastle rather than the main working tree or an external worktree).
+ * Separators are normalized so the check holds on Windows.
+ */
+export const isManagedWorktreePath = (
+  worktreePath: string,
+  worktreesDir: string,
+): boolean =>
+  normalizePath(worktreePath).startsWith(normalizePath(worktreesDir));
+
+/**
+ * Whether a directory entry under `.sandcastle/worktrees/` is orphaned — not
+ * present in the set of active worktree paths reported by git. Both sides are
+ * normalized so paths from `join` (backslashes on Windows) match git's
+ * forward-slash output.
+ */
+export const isOrphanedWorktreePath = (
+  entryPath: string,
+  activeWorktreePaths: Iterable<string>,
+): boolean => {
+  const normalizedEntry = normalizePath(entryPath);
+  for (const active of activeWorktreePaths) {
+    if (normalizePath(active) === normalizedEntry) return false;
+  }
+  return true;
+};
 
 /** Parses `git worktree list --porcelain` output into structured entries. */
 const listWorktrees = (
@@ -115,14 +203,98 @@ const listWorktrees = (
   );
 
 /**
+ * On the clean-reuse path, fetches `origin/<branch>` into the worktree and
+ * fast-forwards local HEAD. Skipped silently (with an explanatory log) when:
+ *
+ * - HEAD is not attached to `<branch>` — a mid-rebase worktree paused at an
+ *   `edit`/`exec`/`break` instruction has a clean working tree but a detached
+ *   HEAD pointing at the pause point. `git merge --ff-only` there would
+ *   silently advance HEAD past the pause and break `git rebase --continue`;
+ * - the fetch fails (no `origin`, unreachable network, branch missing on
+ *   origin) — the worktree is reused as-is, never breaking the run; or
+ * - the local branch has diverged from `origin/<branch>` (unpushed commits +
+ *   moved origin), in which case `--ff-only` refuses and the unpushed work
+ *   is preserved exactly as it was.
+ *
+ * Errors here are non-fatal by design (ADR 0003): the worst case is the same
+ * stale-but-usable worktree the caller would have had before this refresh
+ * existed.
+ */
+const fastForwardFromOrigin = (
+  worktreePath: string,
+  branch: string,
+): Effect.Effect<void, never> =>
+  Effect.gen(function* () {
+    // `symbolic-ref --quiet HEAD` exits non-zero when HEAD is detached;
+    // map both failure and an unexpected target to "" so the predicate
+    // below treats them the same as "not on this branch".
+    const headRef = yield* execGit(
+      ["symbolic-ref", "--quiet", "HEAD"],
+      worktreePath,
+    ).pipe(
+      Effect.map((s) => s.trim()),
+      Effect.orElseSucceed(() => ""),
+    );
+    if (headRef !== `refs/heads/${branch}`) {
+      console.log(
+        `Reusing worktree at ${worktreePath} (branch '${branch}') — HEAD is not on '${branch}', skipping origin refresh`,
+      );
+      return;
+    }
+    const fetchResult = yield* Effect.either(
+      execGit(
+        [...NO_CONFIG_LOCK_FLAGS, "fetch", "origin", branch],
+        worktreePath,
+      ),
+    );
+    if (fetchResult._tag === "Left") {
+      console.log(
+        `Could not fetch from origin (reusing worktree at ${worktreePath} as-is, branch '${branch}')`,
+      );
+      return;
+    }
+    const before = yield* execGit(["rev-parse", "HEAD"], worktreePath).pipe(
+      Effect.map((s) => s.trim()),
+      Effect.orElseSucceed(() => ""),
+    );
+    const mergeResult = yield* Effect.either(
+      execGit(
+        [...NO_CONFIG_LOCK_FLAGS, "merge", "--ff-only", `origin/${branch}`],
+        worktreePath,
+      ),
+    );
+    if (mergeResult._tag === "Left") {
+      console.log(
+        `Branch '${branch}' has diverged from origin (reusing worktree at ${worktreePath} as-is)`,
+      );
+      return;
+    }
+    const after = yield* execGit(["rev-parse", "HEAD"], worktreePath).pipe(
+      Effect.map((s) => s.trim()),
+      Effect.orElseSucceed(() => ""),
+    );
+    if (before && after && before !== after) {
+      console.log(
+        `Fast-forwarded worktree at ${worktreePath} (branch '${branch}') to origin/${branch}`,
+      );
+    } else {
+      console.log(
+        `Reusing existing worktree at ${worktreePath} (branch '${branch}')`,
+      );
+    }
+  });
+
+/**
  * Creates a git worktree at `.sandcastle/worktrees/<name>/`.
  *
  * - If `branch` is specified, checks out that branch.
  * - If not, creates a temporary `sandcastle/<timestamp>` branch.
  *
  * When `branch` collides with an existing managed worktree:
- * - Clean → reuses the existing worktree.
- * - Dirty (uncommitted changes) → reuses with a console warning (ADR 0003).
+ * - Clean → reuses the existing worktree and fast-forwards it from
+ *   `origin/<branch>` when it is strictly behind (ADR 0003). A failed fetch
+ *   or a diverged branch is non-fatal and falls back to plain reuse.
+ * - Dirty (uncommitted changes) → reuses with a console warning, no refresh.
  *
  * Collisions with the main working tree or external worktrees always throw.
  */
@@ -153,13 +325,14 @@ export const create = (
       worktreeName = branch.replace(/\//g, "-");
     } else {
       const timestamp = formatTimestamp(new Date());
+      const suffix = randomBranchSuffix();
       if (opts?.name) {
         const sanitized = sanitizeName(opts.name);
-        branch = `sandcastle/${sanitized}/${timestamp}`;
-        worktreeName = `sandcastle-${sanitized}-${timestamp}`;
+        branch = `sandcastle/${sanitized}/${timestamp}-${suffix}`;
+        worktreeName = `sandcastle-${sanitized}-${timestamp}-${suffix}`;
       } else {
-        branch = `sandcastle/${timestamp}`;
-        worktreeName = `sandcastle-${timestamp}`;
+        branch = `sandcastle/${timestamp}-${suffix}`;
+        worktreeName = `sandcastle-${timestamp}-${suffix}`;
       }
     }
 
@@ -170,24 +343,25 @@ export const create = (
       // Match by branch first; fall back to target path (covers mid-rebase
       // detached-HEAD state where the branch field is null).
       const existing = yield* listWorktrees(repoDir);
-      const collision =
-        existing.find((wt) => wt.branch === branch) ??
-        existing.find((wt) => wt.path === worktreePath);
+      const collision = findCollidingWorktree(existing, branch, worktreePath);
       if (collision) {
         // Only reuse worktrees managed by sandcastle (under .sandcastle/worktrees/)
-        const isManagedWorktree = collision.path.startsWith(worktreesDir);
-        if (isManagedWorktree) {
+        if (isManagedWorktreePath(collision.path, worktreesDir)) {
+          const returnedPath =
+            normalizePath(collision.path) === normalizePath(worktreePath)
+              ? worktreePath
+              : normalize(collision.path);
           const dirty = yield* hasUncommittedChanges(collision.path);
           if (dirty) {
             console.warn(
               `Reusing worktree at ${collision.path} (branch '${branch}') — worktree has uncommitted changes`,
             );
           } else {
-            console.log(
-              `Reusing existing worktree at ${collision.path} (branch '${branch}')`,
-            );
+            yield* fastForwardFromOrigin(collision.path, branch);
           }
-          return { path: collision.path, branch };
+          // git reports forward slashes even on Windows; return a
+          // platform-native path so downstream join/fs calls stay consistent.
+          return { path: returnedPath, branch };
         }
         // Branch is checked out in the main working tree or external worktree
         yield* Effect.fail(
@@ -351,7 +525,7 @@ export const pruneStale = (
         Effect.map((s) => s.type === "Directory"),
         Effect.catchAll(() => Effect.succeed(false)),
       );
-      if (isDir && !activeWorktreePaths.has(entryPath)) {
+      if (isDir && isOrphanedWorktreePath(entryPath, activeWorktreePaths)) {
         yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
           Effect.mapError(
             (e) =>

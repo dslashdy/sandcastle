@@ -18,7 +18,9 @@ You may write more than one changeset per commit, if the commit touches multiple
 
 ---
 
-When writing sandbox providers, don't use any shared abstractions between them. Each provider, for instance Vercel and Daytona, is a different concern and shouldn't share code.
+When writing sandbox providers, don't share provider-specific code between them. Each provider — for instance Vercel and Daytona — integrates a different SDK and is a different concern; that integration logic must not be shared, even when two providers look similar today, because they will diverge.
+
+The one exception is **pure, provider-agnostic utilities**: logic that references no provider SDK, no provider config, and whose behavior is purely a function of its inputs (e.g. a bounded string-tail buffer). These may live in a shared module. Test: if you can't tell which provider a function is for by reading it, it's a utility, not a shared abstraction.
 
 ---
 
@@ -40,7 +42,15 @@ Host-side paths (anything under `tmpdir()`, `hostRepoDir`, the host projects dir
 
 ---
 
+When comparing two paths — `===`, `startsWith`, `Set.has`, `.includes`, etc. — normalize separators on both sides first (e.g. `p.replace(/\\/g, "/")`). `git` reports forward slashes on every platform, while `node:path.join`/`normalize` emit `\` on Windows, so a raw comparison between a git-derived path and a join-derived path silently fails on Windows. This is invisible on Linux/macOS CI because both sources emit `/` there, so it will not surface in tests unless you deliberately mix the two separator styles. When the result is returned for downstream `join`/fs use, re-apply platform-native `normalize` so callers get consistent separators; only the comparison needs forward slashes.
+
+---
+
 Optional parameters passed to functions should be scrutinised extremely carefully. They are a huge source of bugs (by omission). Prioritise correctness over backwards compatibility.
+
+---
+
+Every interactive prompt in the `sandcastle init` flow must be paired with a non-interactive CLI flag that resolves the same choice. They are linked: adding a new prompt without adding the matching flag breaks scripted / CI setup (no TTY → the prompt wedges or crashes), and adding a flag without wiring it into the prompt path leaves the interactive experience inconsistent. When stdin is not a TTY and the flag is absent for a prompt that would otherwise fire, fail fast with a message naming the missing flag rather than letting the prompt library crash. New prompt + new flag land in the same change.
 
 ---
 

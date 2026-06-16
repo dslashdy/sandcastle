@@ -1,9 +1,8 @@
 import { Command, Options } from "@effect/cli";
 import { FileSystem } from "@effect/platform";
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 import * as clack from "@clack/prompts";
 import { execSync } from "node:child_process";
-import { createRequire } from "node:module";
 import { join } from "node:path";
 import { styleText } from "node:util";
 
@@ -22,23 +21,26 @@ import {
   listTemplates,
   listAgents,
   getAgent,
-  listBacklogManagers,
-  getBacklogManager,
+  listIssueTrackers,
+  getIssueTracker,
   listSandboxProviders,
   getSandboxProvider,
   isSandboxProviderSupportedForAgent,
+  unsupportedSandboxProviderMessage,
   getNextStepsLines,
+  detectPackageManager,
+  addDependencyCommand,
+  hostHasDependency,
+  getTemplateDependencies,
 } from "./InitService.js";
 import { defaultImageName } from "./sandboxes/docker.js";
 import type {
   AgentEntry,
-  BacklogManagerEntry,
+  IssueTrackerEntry,
   SandboxProviderEntry,
 } from "./InitService.js";
 import { ConfigDirError, InitError } from "./errors.js";
-
-const require = createRequire(import.meta.url);
-const VERSION = (require("../package.json") as { version: string }).version;
+import { VERSION } from "./version.js";
 
 // --- Shared options ---
 
@@ -48,7 +50,7 @@ const imageNameOption = Options.text("image-name").pipe(
 );
 
 const resolveImageName = (
-  cliFlag: import("effect").Option.Option<string>,
+  cliFlag: Option.Option<string>,
   cwd: string,
 ): string => (cliFlag._tag === "Some" ? cliFlag.value : defaultImageName(cwd));
 
@@ -111,6 +113,52 @@ const sandboxOption = Options.text("sandbox").pipe(
   Options.optional,
 );
 
+const issueTrackerOption = Options.text("issue-tracker").pipe(
+  Options.withDescription(
+    "Issue tracker to use (e.g. github-issues, beads, custom)",
+  ),
+  Options.optional,
+);
+
+// Tri-state booleans (Some(true) / Some(false) / None) so we can tell "user
+// chose false" from "user didn't pass the flag at all" — only the latter
+// triggers the interactive prompt.
+const createLabelOption = Options.choice("create-label", [
+  "true",
+  "false",
+]).pipe(
+  Options.withDescription(
+    'Whether to create the "Sandcastle" GitHub label (only meaningful with --issue-tracker github-issues)',
+  ),
+  Options.optional,
+);
+
+const buildImageOption = Options.choice("build-image", ["true", "false"]).pipe(
+  Options.withDescription(
+    "Whether to build the sandbox image now (ignored when --issue-tracker custom is selected)",
+  ),
+  Options.optional,
+);
+
+const installTemplateDepsOption = Options.choice("install-template-deps", [
+  "true",
+  "false",
+]).pipe(
+  Options.withDescription(
+    "Whether to install the template's host dependencies (e.g. zod for the planner templates)",
+  ),
+  Options.optional,
+);
+
+/**
+ * Translate an `Options.choice("flag", ["true", "false"]).optional` value into
+ * a tri-state boolean. None when the flag was absent; otherwise the parsed bool.
+ */
+const choiceToTriBool = (
+  opt: Option.Option<"true" | "false">,
+): Option.Option<boolean> =>
+  opt._tag === "Some" ? Option.some(opt.value === "true") : Option.none();
+
 const initCommand = Command.make(
   "init",
   {
@@ -119,6 +167,10 @@ const initCommand = Command.make(
     agent: agentOption,
     model: initModelOption,
     sandbox: sandboxOption,
+    issueTracker: issueTrackerOption,
+    createLabel: createLabelOption,
+    buildImage: buildImageOption,
+    installTemplateDeps: installTemplateDepsOption,
   },
   ({
     imageName: imageNameFlag,
@@ -126,6 +178,10 @@ const initCommand = Command.make(
     agent: agentFlag,
     model: modelFlag,
     sandbox: sandboxFlag,
+    issueTracker: issueTrackerFlag,
+    createLabel: createLabelFlag,
+    buildImage: buildImageFlag,
+    installTemplateDeps: installTemplateDepsFlag,
   }) =>
     Effect.gen(function* () {
       const d = yield* Display;
@@ -146,6 +202,76 @@ const initCommand = Command.make(
         }
       }
 
+      if (sandboxFlag._tag === "Some") {
+        const valid = getSandboxProvider(sandboxFlag.value);
+        if (!valid) {
+          const names = listSandboxProviders()
+            .map((p) => p.name)
+            .join(", ");
+          yield* Effect.fail(
+            new InitError({
+              message: `Unknown sandbox provider "${sandboxFlag.value}". Available: ${names}`,
+            }),
+          );
+        }
+      }
+
+      if (issueTrackerFlag._tag === "Some") {
+        const valid = getIssueTracker(issueTrackerFlag.value);
+        if (!valid) {
+          const names = listIssueTrackers()
+            .map((t) => t.name)
+            .join(", ");
+          yield* Effect.fail(
+            new InitError({
+              message: `Unknown issue tracker "${issueTrackerFlag.value}". Available: ${names}`,
+            }),
+          );
+        }
+      }
+
+      const createLabelChoice = choiceToTriBool(createLabelFlag);
+      const buildImageChoice = choiceToTriBool(buildImageFlag);
+      const installTemplateDepsChoice = choiceToTriBool(
+        installTemplateDepsFlag,
+      );
+
+      const isInteractive = process.stdin.isTTY === true;
+      const failIfNonInteractive = (flag: string) =>
+        Effect.fail(
+          new InitError({
+            message: `${flag} is required in non-interactive mode (no TTY detected).`,
+          }),
+        );
+
+      // Tri-state confirm: CLI flag wins; otherwise prompt interactively (or
+      // fail fast in non-interactive mode naming the missing flag). Cancelling
+      // the prompt is treated as abort — same shape as the select prompts above.
+      const resolveConfirmFlag = (params: {
+        choice: Option.Option<boolean>;
+        flag: string;
+        promptMessage: string;
+        cancelMessage: string;
+      }): Effect.Effect<boolean, InitError> =>
+        Effect.gen(function* () {
+          if (params.choice._tag === "Some") return params.choice.value;
+          if (!isInteractive) {
+            yield* failIfNonInteractive(params.flag);
+          }
+          const confirmed = yield* Effect.promise(() =>
+            clack.confirm({
+              message: params.promptMessage,
+              initialValue: true,
+            }),
+          );
+          if (clack.isCancel(confirmed)) {
+            yield* Effect.fail(
+              new InitError({ message: params.cancelMessage }),
+            );
+          }
+          return confirmed === true;
+        });
+
       // Resolve agent: CLI flag > interactive select
       const agents = listAgents();
       let selectedAgent: AgentEntry;
@@ -161,6 +287,9 @@ const initCommand = Command.make(
         }
         selectedAgent = entry!;
       } else {
+        if (!isInteractive) {
+          yield* failIfNonInteractive("--agent");
+        }
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: "Select an agent:",
@@ -186,45 +315,31 @@ const initCommand = Command.make(
           ? modelFlag.value
           : selectedAgent.defaultModel;
 
-      // Resolve sandbox provider: CLI flag > interactive select.
-      // Some runtimes are agent-aware: SBX currently supports Claude Code and Codex.
+      // Resolve sandbox provider: CLI flag > interactive select (no default — user must choose)
       const sandboxProviders = listSandboxProviders().filter((provider) =>
         isSandboxProviderSupportedForAgent(provider, selectedAgent),
       );
       let selectedSandboxProvider: SandboxProviderEntry;
       if (sandboxFlag._tag === "Some") {
-        const maybeEntry = getSandboxProvider(sandboxFlag.value);
-        if (!maybeEntry) {
-          const names = listSandboxProviders()
-            .map((provider) => provider.name)
-            .join(", ");
-          yield* Effect.fail(
-            new InitError({
-              message: `Unknown sandbox provider "${sandboxFlag.value}". Available: ${names}`,
-            }),
-          );
-        }
-        const entry = maybeEntry!;
+        const entry = getSandboxProvider(sandboxFlag.value)!;
         if (!isSandboxProviderSupportedForAgent(entry, selectedAgent)) {
-          const supported =
-            entry.supportedAgentNames?.join(", ") ?? "all agents";
           yield* Effect.fail(
             new InitError({
-              message: `Sandbox provider "${entry.name}" does not support agent "${selectedAgent.name}". Supported agents: ${supported}`,
+              message: unsupportedSandboxProviderMessage(entry, selectedAgent),
             }),
           );
         }
         selectedSandboxProvider = entry;
       } else {
+        if (!isInteractive) {
+          yield* failIfNonInteractive("--sandbox");
+        }
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: "Select a sandbox provider:",
             options: sandboxProviders.map((p) => ({
               value: p.name,
               label: p.label,
-              hint: p.requiresImageBuild
-                ? "Builds a local image"
-                : "Uses a prebuilt runtime",
             })),
           }),
         );
@@ -238,15 +353,20 @@ const initCommand = Command.make(
         selectedSandboxProvider = getSandboxProvider(selected as string)!;
       }
 
-      // Resolve backlog manager: interactive select
-      const backlogManagers = listBacklogManagers();
-      let selectedBacklogManager: BacklogManagerEntry;
-      {
+      // Resolve issue tracker: CLI flag > interactive select (already validated above)
+      const issueTrackers = listIssueTrackers();
+      let selectedIssueTracker: IssueTrackerEntry;
+      if (issueTrackerFlag._tag === "Some") {
+        selectedIssueTracker = getIssueTracker(issueTrackerFlag.value)!;
+      } else {
+        if (!isInteractive) {
+          yield* failIfNonInteractive("--issue-tracker");
+        }
         const selected = yield* Effect.promise(() =>
           clack.select({
-            message: "Select a backlog manager:",
+            message: "Select an issue tracker:",
             initialValue: "github-issues",
-            options: backlogManagers.map((b) => ({
+            options: issueTrackers.map((b) => ({
               value: b.name,
               label: b.label,
             })),
@@ -255,11 +375,11 @@ const initCommand = Command.make(
         if (clack.isCancel(selected)) {
           yield* Effect.fail(
             new InitError({
-              message: "Backlog manager selection cancelled.",
+              message: "Issue tracker selection cancelled.",
             }),
           );
         }
-        selectedBacklogManager = getBacklogManager(selected as string)!;
+        selectedIssueTracker = getIssueTracker(selected as string)!;
       }
 
       // Resolve template: CLI flag > interactive select (already validated above)
@@ -267,6 +387,9 @@ const initCommand = Command.make(
       if (template._tag === "Some") {
         selectedTemplate = template.value;
       } else {
+        if (!isInteractive) {
+          yield* failIfNonInteractive("--template");
+        }
         const selected = yield* Effect.promise(() =>
           clack.select({
             message: "Select a template:",
@@ -286,18 +409,19 @@ const initCommand = Command.make(
         selectedTemplate = selected as string;
       }
 
-      // Offer to create the "Sandcastle" label on the repo (skip for non-GitHub backlog managers)
-      let shouldCreateLabel: boolean | symbol = false;
-      if (selectedBacklogManager.name === "github-issues") {
-        shouldCreateLabel = yield* Effect.promise(() =>
-          clack.confirm({
-            message:
-              'Create a "Sandcastle" GitHub label? (Templates filter issues by this label)',
-            initialValue: true,
-          }),
-        );
+      // Offer to create the "Sandcastle" label on the repo (skip for non-GitHub issue trackers).
+      // CLI flag > interactive confirm. The flag is only meaningful for the github-issues tracker.
+      let shouldCreateLabel = false;
+      if (selectedIssueTracker.name === "github-issues") {
+        shouldCreateLabel = yield* resolveConfirmFlag({
+          choice: createLabelChoice,
+          flag: "--create-label",
+          promptMessage:
+            'Create a "Sandcastle" GitHub label? (Templates filter issues by this label)',
+          cancelMessage: "Label selection cancelled.",
+        });
 
-        if (shouldCreateLabel === true) {
+        if (shouldCreateLabel) {
           yield* Effect.try({
             try: () =>
               execSync(
@@ -315,8 +439,8 @@ const initCommand = Command.make(
           agent: selectedAgent,
           model: selectedModel,
           templateName: selectedTemplate,
-          createLabel: shouldCreateLabel === true,
-          backlogManager: selectedBacklogManager,
+          createLabel: shouldCreateLabel,
+          issueTracker: selectedIssueTracker,
           sandboxProvider: selectedSandboxProvider,
           imageName,
         }).pipe(
@@ -329,17 +453,63 @@ const initCommand = Command.make(
         ),
       );
 
+      // Detect the host package manager so the zod offer below and the next
+      // steps below both use the right install command.
+      const packageManager = yield* detectPackageManager(cwd);
+
+      // If the chosen template imports zod on the host (the planner templates
+      // build their <plan> output schema with it) and the host doesn't already
+      // declare it, offer to install it. Without this, the very first
+      // `npx tsx .sandcastle/main.ts` crashes with ERR_MODULE_NOT_FOUND.
+      if (getTemplateDependencies(selectedTemplate).includes("zod")) {
+        const alreadyInstalled = yield* hostHasDependency(cwd, "zod");
+        if (!alreadyInstalled) {
+          const installCmd = addDependencyCommand(packageManager, "zod");
+          const shouldInstall = yield* resolveConfirmFlag({
+            choice: installTemplateDepsChoice,
+            flag: "--install-template-deps",
+            promptMessage: `The ${selectedTemplate} template needs a schema validator. Install zod now (\`${installCmd}\`)?`,
+            cancelMessage: "Install-template-deps selection cancelled.",
+          });
+          if (shouldInstall) {
+            const installed = yield* Effect.sync(() => {
+              try {
+                execSync(installCmd, { cwd, stdio: "ignore" });
+                return true;
+              } catch {
+                return false;
+              }
+            });
+            yield* installed
+              ? d.status(`Installed zod with ${packageManager}.`, "success")
+              : d.status(
+                  `Couldn't install zod automatically. Run \`${installCmd}\` before running the agent.`,
+                  "warn",
+                );
+          }
+        }
+      }
+
+      // Prompt user before building image. The custom issue tracker scaffolds
+      // an intentionally unfinished Dockerfile (the install block is a TODO),
+      // so there is nothing valid to build yet — skip the build prompt entirely
+      // (and silently ignore --build-image) and let the next steps point the
+      // user at the setup doc.
       const providerLabel = selectedSandboxProvider.label;
-
-      if (selectedSandboxProvider.requiresImageBuild) {
-        const shouldBuild = yield* Effect.promise(() =>
-          clack.confirm({
-            message: `Build the default ${providerLabel} image now?`,
-            initialValue: true,
-          }),
+      if (selectedIssueTracker.name === "custom") {
+        yield* d.status(
+          "Init complete! Your custom issue tracker isn't configured yet — see the steps below before building.",
+          "success",
         );
+      } else {
+        const shouldBuild = yield* resolveConfirmFlag({
+          choice: buildImageChoice,
+          flag: "--build-image",
+          promptMessage: `Build the default ${providerLabel} image now?`,
+          cancelMessage: "Build-image selection cancelled.",
+        });
 
-        if (shouldBuild === true) {
+        if (shouldBuild && selectedSandboxProvider.requiresImageBuild) {
           const containerfileDir = join(cwd, CONFIG_DIR);
           if (selectedSandboxProvider.name === "podman") {
             yield* d.spinner(
@@ -374,17 +544,15 @@ const initCommand = Command.make(
             "success",
           );
         }
-      } else {
-        yield* d.status(
-          `Init complete! ${providerLabel} uses a prebuilt runtime, so no image build is needed.`,
-          "success",
-        );
       }
 
       // Show template-specific next steps
       const nextSteps = getNextStepsLines(
         selectedTemplate,
         scaffoldResult.mainFilename,
+        selectedIssueTracker,
+        selectedAgent,
+        packageManager,
       );
       for (const [i, line] of nextSteps.entries()) {
         yield* d.text(i === 0 ? line : styleText("dim", line));

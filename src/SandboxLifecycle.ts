@@ -1,6 +1,6 @@
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import { Deferred, Effect } from "effect";
+import { Deferred, Duration, Effect, Schedule } from "effect";
 import { Display } from "./Display.js";
 import {
   CommitCollectionTimeoutError,
@@ -12,16 +12,32 @@ import {
   withTimeout,
   type SandboxError,
 } from "./errors.js";
-import {
-  Sandbox,
-  type ExecResult,
-  type SandboxService,
-} from "./SandboxFactory.js";
+import { type ExecResult, type SandboxService } from "./SandboxFactory.js";
+import type { Timeouts } from "./run.js";
+import { countCommitsToSync } from "./syncOut.js";
 
 const GIT_SETUP_TIMEOUT_MS = 30_000;
 const HOOK_TIMEOUT_MS = 60_000;
 const COMMIT_COLLECTION_TIMEOUT_MS = 30_000;
 const MERGE_TO_HOST_TIMEOUT_MS = 30_000;
+
+/** Number of times a transient git setup exec is retried after the first attempt. */
+const GIT_SETUP_MAX_RETRIES = 2;
+/** Delay between git setup retries — long enough to let a transient exec race clear. */
+const GIT_SETUP_RETRY_DELAY_MS = 250;
+
+/**
+ * Exit codes that indicate the shell could not exec the command rather than the
+ * command itself failing — symptoms of a transient race under heavy container
+ * load (e.g. overlayfs not yet ready, or the process being killed). Worth a retry.
+ * 126: command found but not executable / exec failed. 137: killed (128 + SIGKILL).
+ */
+const TRANSIENT_EXEC_EXIT_CODES = new Set([126, 137]);
+
+const isTransientExecError = (err: ExecError | GitSetupTimeoutError): boolean =>
+  err._tag === "ExecError" &&
+  err.exitCode !== undefined &&
+  TRANSIENT_EXEC_EXIT_CODES.has(err.exitCode);
 
 const execOk = (
   sandbox: SandboxService,
@@ -33,6 +49,7 @@ const execOk = (
       ? Effect.fail(
           new ExecError({
             command,
+            exitCode: result.exitCode,
             message: `Command failed (exit ${result.exitCode}): ${command}\n${result.stderr}`,
           }),
         )
@@ -42,18 +59,26 @@ const execOk = (
 const execOkWithGitTimeout = (
   sandbox: SandboxService,
   command: string,
+  gitSetupTimeoutMs: number,
   options?: { cwd?: string },
 ): Effect.Effect<ExecResult, ExecError | GitSetupTimeoutError> =>
   execOk(sandbox, command, options).pipe(
     withTimeout(
-      GIT_SETUP_TIMEOUT_MS,
+      gitSetupTimeoutMs,
       () =>
         new GitSetupTimeoutError({
-          message: `Git command timed out after ${GIT_SETUP_TIMEOUT_MS}ms: ${command}`,
-          timeoutMs: GIT_SETUP_TIMEOUT_MS,
+          message: `Git command timed out after ${gitSetupTimeoutMs}ms: ${command}`,
+          timeoutMs: gitSetupTimeoutMs,
           command,
         }),
     ),
+    // Each attempt is bounded by its own timeout (above); retry only transient
+    // exec races, so a genuine git error or a hung exec still fails fast.
+    Effect.retry({
+      while: isTransientExecError,
+      times: GIT_SETUP_MAX_RETRIES,
+      schedule: Schedule.spaced(Duration.millis(GIT_SETUP_RETRY_DELAY_MS)),
+    }),
   );
 
 const execAsync = promisify(exec);
@@ -130,6 +155,8 @@ export interface SandboxLifecycleOptions {
   /** AbortSignal passed through to lifecycle hooks so they can cooperatively cancel.
    *  When omitted, hooks receive a never-aborted signal. */
   readonly signal?: AbortSignal;
+  /** Override default timeouts for built-in lifecycle steps. Unset keys keep their defaults. */
+  readonly timeouts?: Timeouts;
 }
 
 export interface SandboxContext {
@@ -146,15 +173,21 @@ export interface SandboxLifecycleResult<A> {
 
 export const withSandboxLifecycle = <A>(
   options: SandboxLifecycleOptions,
-  work: (
-    ctx: SandboxContext,
-  ) => Effect.Effect<A, SandboxError, Sandbox | Display>,
-): Effect.Effect<SandboxLifecycleResult<A>, SandboxError, Sandbox | Display> =>
+  sandbox: SandboxService,
+  work: (ctx: SandboxContext) => Effect.Effect<A, SandboxError, Display>,
+): Effect.Effect<SandboxLifecycleResult<A>, SandboxError, Display> =>
   Effect.gen(function* () {
-    const sandbox = yield* Sandbox;
     const display = yield* Display;
     const { hostRepoDir, sandboxRepoDir, hooks, branch, hostWorktreePath } =
       options;
+
+    // Resolve effective timeouts, falling back to the built-in defaults.
+    const gitSetupTimeoutMs =
+      options.timeouts?.gitSetupMs ?? GIT_SETUP_TIMEOUT_MS;
+    const commitCollectionTimeoutMs =
+      options.timeouts?.commitCollectionMs ?? COMMIT_COLLECTION_TIMEOUT_MS;
+    const mergeToHostTimeoutMs =
+      options.timeouts?.mergeToHostMs ?? MERGE_TO_HOST_TIMEOUT_MS;
 
     // Resolve signal: use caller's signal or a never-aborted one so hooks
     // can unconditionally reference it without null-checking.
@@ -198,6 +231,7 @@ export const withSandboxLifecycle = <A>(
         yield* execOkWithGitTimeout(
           sandbox,
           `git config --global --add safe.directory "${sandboxRepoDir}"`,
+          gitSetupTimeoutMs,
         );
 
         // Propagate host git identity into the sandbox so commits are attributed
@@ -206,12 +240,14 @@ export const withSandboxLifecycle = <A>(
           yield* execOkWithGitTimeout(
             sandbox,
             `git config --global user.name "${hostGitName.replace(/"/g, '\\"')}"`,
+            gitSetupTimeoutMs,
           );
         }
         if (hostGitEmail) {
           yield* execOkWithGitTimeout(
             sandbox,
             `git config --global user.email "${hostGitEmail.replace(/"/g, '\\"')}"`,
+            gitSetupTimeoutMs,
           );
         }
 
@@ -219,6 +255,7 @@ export const withSandboxLifecycle = <A>(
         resolvedBranch = (yield* execOkWithGitTimeout(
           sandbox,
           "git rev-parse --abbrev-ref HEAD",
+          gitSetupTimeoutMs,
           { cwd: sandboxRepoDir },
         )).stdout.trim();
 
@@ -341,16 +378,16 @@ export const withSandboxLifecycle = <A>(
     // Run the caller's work
     const result = yield* work({ sandbox, sandboxRepoDir, baseHead });
 
-    // Sync changes from sandbox to host worktree (isolated sandbox only)
+    // Sync changes from sandbox to host worktree (isolated sandbox only).
+    // The count resolves the base from the same sandbox-owned ref `syncOut`
+    // uses, so on run 2+ we don't anchor to the host's `am`-rewritten HEAD
+    // (which the sandbox has never seen) and silently degrade to 0.
     if (options.applyToHost) {
-      const countResult = yield* sandbox.exec(
-        `git rev-list "${baseHead}..HEAD" --count`,
-        { cwd: sandboxRepoDir },
+      const commitCount = yield* countCommitsToSync(
+        sandbox,
+        sandboxRepoDir,
+        baseHead,
       );
-      const commitCount =
-        countResult.exitCode === 0
-          ? parseInt(countResult.stdout.trim(), 10)
-          : 0;
 
       yield* display.taskLog(
         commitCount > 0
@@ -411,11 +448,11 @@ export const withSandboxLifecycle = <A>(
               }),
           }).pipe(
             withTimeout(
-              MERGE_TO_HOST_TIMEOUT_MS,
+              mergeToHostTimeoutMs,
               () =>
                 new MergeToHostTimeoutError({
-                  message: `Merge of '${resolvedBranch}' to '${hostCurrentBranch}' timed out after ${MERGE_TO_HOST_TIMEOUT_MS}ms`,
-                  timeoutMs: MERGE_TO_HOST_TIMEOUT_MS,
+                  message: `Merge of '${resolvedBranch}' to '${hostCurrentBranch}' timed out after ${mergeToHostTimeoutMs}ms`,
+                  timeoutMs: mergeToHostTimeoutMs,
                   sourceBranch: resolvedBranch,
                   targetBranch: hostCurrentBranch,
                 }),
@@ -447,11 +484,11 @@ export const withSandboxLifecycle = <A>(
           }
         }).pipe(
           withTimeout(
-            COMMIT_COLLECTION_TIMEOUT_MS,
+            commitCollectionTimeoutMs,
             () =>
               new CommitCollectionTimeoutError({
-                message: `Commit collection timed out after ${COMMIT_COLLECTION_TIMEOUT_MS}ms`,
-                timeoutMs: COMMIT_COLLECTION_TIMEOUT_MS,
+                message: `Commit collection timed out after ${commitCollectionTimeoutMs}ms`,
+                timeoutMs: commitCollectionTimeoutMs,
               }),
           ),
         ),
@@ -476,11 +513,11 @@ export const withSandboxLifecycle = <A>(
           }
         }).pipe(
           withTimeout(
-            COMMIT_COLLECTION_TIMEOUT_MS,
+            commitCollectionTimeoutMs,
             () =>
               new CommitCollectionTimeoutError({
-                message: `Commit collection timed out after ${COMMIT_COLLECTION_TIMEOUT_MS}ms`,
-                timeoutMs: COMMIT_COLLECTION_TIMEOUT_MS,
+                message: `Commit collection timed out after ${commitCollectionTimeoutMs}ms`,
+                timeoutMs: commitCollectionTimeoutMs,
               }),
           ),
         ),

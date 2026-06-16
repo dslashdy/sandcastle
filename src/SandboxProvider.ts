@@ -292,22 +292,18 @@ export type BranchStrategy =
   | NoSandboxBranchStrategy;
 
 /**
- * A sandbox provider — the pluggable unit that `run()` and `createSandbox()` accept.
- * Tagged for internal dispatch: "bind-mount" or "isolated".
- * Does not include `NoSandboxProvider` — that is only valid for `interactive()`.
+ * A sandbox provider — the pluggable unit that `run()`, `interactive()`, and
+ * `createSandbox()` accept. Tagged for internal dispatch: "bind-mount",
+ * "isolated", or "none". When `NoSandboxProvider` is used, the agent runs
+ * directly on the host with no container isolation — opt in at your own risk.
  */
 export type SandboxProvider =
   | BindMountSandboxProvider
-  | IsolatedSandboxProvider;
-
-/**
- * Any sandbox provider, including no-sandbox.
- * This is the union accepted by `interactive()`.
- */
-export type AnySandboxProvider =
-  | BindMountSandboxProvider
   | IsolatedSandboxProvider
   | NoSandboxProvider;
+
+/** @deprecated Use `SandboxProvider` — it now includes `NoSandboxProvider`. */
+export type AnySandboxProvider = SandboxProvider;
 
 /**
  * Create a bind-mount sandbox provider from a config object.

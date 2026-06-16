@@ -1,14 +1,15 @@
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
+import { makeSandboxFromHandle } from "./SandboxFactory.js";
 import { testIsolated } from "./sandboxes/test-isolated.js";
 import { syncIn } from "./syncIn.js";
-import { syncOut } from "./syncOut.js";
+import { countCommitsToSync, syncOut } from "./syncOut.js";
 
 const execAsync = promisify(exec);
 
@@ -346,6 +347,48 @@ describe("syncOut", () => {
     }
   });
 
+  it("successful sync-out preserves tracked .sandcastle files", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    // Commit tracked files inside .sandcastle, as a real repo would have
+    await mkdir(join(hostDir, ".sandcastle"), { recursive: true });
+    await commitFile(
+      hostDir,
+      join(".sandcastle", "prompt.md"),
+      "prompt",
+      "add .sandcastle config",
+    );
+    await commitFile(
+      hostDir,
+      join(".sandcastle", "Dockerfile"),
+      "FROM node",
+      "add Dockerfile",
+    );
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+      await handle.exec('echo "new file" > new.txt', { cwd: wp });
+      await handle.exec("git add new.txt", { cwd: wp });
+      await handle.exec('git commit -m "add new file"', { cwd: wp });
+
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      // The whole .sandcastle dir must not be deleted by cleanup
+      expect(existsSync(join(hostDir, ".sandcastle", "prompt.md"))).toBe(true);
+      expect(existsSync(join(hostDir, ".sandcastle", "Dockerfile"))).toBe(true);
+      // But the temporary patches dir should still be cleaned up
+      expect(existsSync(join(hostDir, ".sandcastle", "patches"))).toBe(false);
+    } finally {
+      await handle.close();
+    }
+  });
+
   it("failed git am preserves artifacts and prints recovery message", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "host-"));
     await initRepo(hostDir);
@@ -483,6 +526,209 @@ describe("syncOut", () => {
         cwd: hostDir,
       });
       expect(msg.trim()).toBe("commit from agent");
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("extracts commits across two consecutive syncOut runs on the same sandbox", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+
+      // Pin sandbox commit dates to the past so `git am` on the host (which
+      // uses "now" as the committer date) always produces a new SHA. Without
+      // this, the same-second `am` may reproduce the original SHA and the
+      // bug-under-test hides itself.
+      const dateEnv =
+        "GIT_AUTHOR_DATE='2024-01-01T00:00:00' " +
+        "GIT_COMMITTER_DATE='2024-01-01T00:00:00'";
+
+      // Run 1: commit + sync
+      await handle.exec('echo "first" > first.txt', { cwd: wp });
+      await handle.exec("git add first.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add first"`, { cwd: wp });
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      // Run 2: another commit + sync — host HEAD is now an am-rewritten SHA
+      // unknown to the sandbox, so the old code's `format-patch hostHead..HEAD`
+      // would fail with `Invalid revision range`. The fix tracks the base via
+      // a sandbox-owned ref so this run succeeds.
+      await handle.exec('echo "second" > second.txt', { cwd: wp });
+      await handle.exec("git add second.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add second"`, { cwd: wp });
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      const log = await getLog(hostDir);
+      expect(log).toHaveLength(3);
+      expect(log[0]).toContain("add second");
+      expect(log[1]).toContain("add first");
+
+      const first = await readFile(join(hostDir, "first.txt"), "utf-8");
+      expect(first.trim()).toBe("first");
+      const second = await readFile(join(hostDir, "second.txt"), "utf-8");
+      expect(second.trim()).toBe("second");
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("second syncOut with no new commits is a no-op", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+      const dateEnv =
+        "GIT_AUTHOR_DATE='2024-01-01T00:00:00' " +
+        "GIT_COMMITTER_DATE='2024-01-01T00:00:00'";
+      await handle.exec('echo "new" > new.txt', { cwd: wp });
+      await handle.exec("git add new.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add new"`, { cwd: wp });
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      const { stdout: hostHeadAfterRun1 } = await execAsync(
+        "git rev-parse HEAD",
+        { cwd: hostDir },
+      );
+
+      // Run 2: no new sandbox commits. Must be a no-op for the commits path —
+      // detection compares the sandbox-owned base against sandbox HEAD, so
+      // a hostHead-vs-sandboxHead comparison (which always differs after
+      // run 1's `git am` rewrite) does not retrigger format-patch.
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      const { stdout: hostHeadAfterRun2 } = await execAsync(
+        "git rev-parse HEAD",
+        { cwd: hostDir },
+      );
+      expect(hostHeadAfterRun2.trim()).toBe(hostHeadAfterRun1.trim());
+
+      const patchesDir = join(hostDir, ".sandcastle", "patches");
+      expect(existsSync(patchesDir)).toBe(false);
+    } finally {
+      await handle.close();
+    }
+  });
+});
+
+describe("countCommitsToSync", () => {
+  it("returns 0 after a successful syncOut when no new commits exist (run-2 case)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+      const dateEnv =
+        "GIT_AUTHOR_DATE='2024-01-01T00:00:00' " +
+        "GIT_COMMITTER_DATE='2024-01-01T00:00:00'";
+      await handle.exec('echo "new" > new.txt', { cwd: wp });
+      await handle.exec("git add new.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add new"`, { cwd: wp });
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      // Host HEAD is now an am-rewritten SHA. With the fix, the helper reads
+      // the sandbox-owned base ref instead of falling back to this poisoned
+      // host SHA, so the count comes out as 0 rather than the silent-degrade
+      // fallback the old inline code produced.
+      const { stdout: hostHead } = await execAsync("git rev-parse HEAD", {
+        cwd: hostDir,
+      });
+
+      const sandbox = makeSandboxFromHandle(handle);
+      const count = await Effect.runPromise(
+        countCommitsToSync(sandbox, wp, hostHead.trim()),
+      );
+      expect(count).toBe(0);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("returns the number of new sandbox commits since the last sync", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+      const dateEnv =
+        "GIT_AUTHOR_DATE='2024-01-01T00:00:00' " +
+        "GIT_COMMITTER_DATE='2024-01-01T00:00:00'";
+      await handle.exec('echo "a" > a.txt', { cwd: wp });
+      await handle.exec("git add a.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add a"`, { cwd: wp });
+      await Effect.runPromise(syncOut(hostDir, handle));
+
+      // Two new sandbox commits since the last sync.
+      await handle.exec('echo "b" > b.txt', { cwd: wp });
+      await handle.exec("git add b.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add b"`, { cwd: wp });
+      await handle.exec('echo "c" > c.txt', { cwd: wp });
+      await handle.exec("git add c.txt", { cwd: wp });
+      await handle.exec(`${dateEnv} git commit -m "add c"`, { cwd: wp });
+
+      const { stdout: hostHead } = await execAsync("git rev-parse HEAD", {
+        cwd: hostDir,
+      });
+
+      const sandbox = makeSandboxFromHandle(handle);
+      const count = await Effect.runPromise(
+        countCommitsToSync(sandbox, wp, hostHead.trim()),
+      );
+      expect(count).toBe(2);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("falls back to host HEAD when no sync-base ref is set yet", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "host-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "initial.txt", "initial", "initial commit");
+
+    const provider = testIsolated();
+    const handle = await provider.create({ env: {} });
+    try {
+      await Effect.runPromise(syncIn(hostDir, handle));
+
+      const wp = handle.worktreePath;
+      await handle.exec('echo "new" > new.txt', { cwd: wp });
+      await handle.exec("git add new.txt", { cwd: wp });
+      await handle.exec('git commit -m "add new"', { cwd: wp });
+
+      const { stdout: hostHead } = await execAsync("git rev-parse HEAD", {
+        cwd: hostDir,
+      });
+
+      // Before any syncOut runs the ref is absent; hostHead is the correct
+      // fallback because it still exists in the sandbox (sync-in copied it).
+      const sandbox = makeSandboxFromHandle(handle);
+      const count = await Effect.runPromise(
+        countCommitsToSync(sandbox, wp, hostHead.trim()),
+      );
+      expect(count).toBe(1);
     } finally {
       await handle.close();
     }

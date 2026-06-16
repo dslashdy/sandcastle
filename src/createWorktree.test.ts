@@ -1,6 +1,6 @@
 import { exec, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -12,7 +12,7 @@ import type {
   WorktreeInteractiveOptions,
   WorktreeCreateSandboxOptions,
 } from "./createWorktree.js";
-import { claudeCode } from "./AgentProvider.js";
+import { claudeCode, codex } from "./AgentProvider.js";
 import {
   createBindMountSandboxProvider,
   type BindMountSandboxHandle,
@@ -20,7 +20,7 @@ import {
   type ExecResult,
   type SandboxProvider,
 } from "./SandboxProvider.js";
-import { makeLocalSandboxLayer } from "./testSandbox.js";
+import { makeLocalSandbox } from "./testSandbox.js";
 
 const execAsync = promisify(exec);
 
@@ -560,6 +560,28 @@ const toStreamJson = (output: string): string => {
   return lines.join("\n");
 };
 
+/**
+ * Format a mock codex result as JSON stream lines including a `turn.completed`
+ * usage event so the Orchestrator surfaces usage via `streamUsage`.
+ */
+const toCodexStreamJsonWithUsage = (
+  output: string,
+  usage: {
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+  },
+): string => {
+  const lines: string[] = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: output },
+    }),
+    JSON.stringify({ type: "turn.completed", usage }),
+  ];
+  return lines.join("\n");
+};
+
 describe("worktree.run()", () => {
   /**
    * Create a test bind-mount provider that intercepts agent commands
@@ -587,6 +609,20 @@ describe("worktree.run()", () => {
             if (command.startsWith("claude ")) {
               const output = await mockAgentBehavior(cwd);
               const streamOutput = toStreamJson(output);
+              if (execOptions?.onLine) {
+                for (const line of streamOutput.split("\n")) {
+                  execOptions.onLine(line);
+                }
+              }
+              return { stdout: streamOutput, stderr: "", exitCode: 0 };
+            }
+            if (command.startsWith("codex ")) {
+              const output = await mockAgentBehavior(cwd);
+              const streamOutput = toCodexStreamJsonWithUsage(output, {
+                input_tokens: 50000,
+                cached_input_tokens: 0,
+                output_tokens: 100,
+              });
               if (execOptions?.onLine) {
                 for (const line of streamOutput.split("\n")) {
                   execOptions.onLine(line);
@@ -634,6 +670,39 @@ describe("worktree.run()", () => {
       expect(typeof result.stdout).toBe("string");
       expect(Array.isArray(result.commits)).toBe(true);
       expect(result.branch).toBe("run-test");
+    } finally {
+      await ws.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("emits 'Context window: NNNk' line when an iteration has usage", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "ws-run-ctxwin-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+    const logPath = join(hostDir, "ctxwin.log");
+
+    const sandbox = makeRunTestProvider();
+
+    const ws = await createWorktree({
+      branchStrategy: { type: "branch", branch: "ctxwin-test" },
+      cwd: hostDir,
+    });
+
+    try {
+      const result = await ws.run({
+        agent: codex("gpt-test"),
+        sandbox,
+        prompt: "do something",
+        maxIterations: 1,
+        logging: { type: "file", path: logPath },
+      });
+
+      // Sanity-check: orchestrator surfaced usage on the iteration.
+      expect(result.iterations[0]!.usage).toBeDefined();
+
+      const log = await readFile(logPath, "utf-8");
+      expect(log).toContain("Context window: 50k");
     } finally {
       await ws.close();
       await rm(hostDir, { recursive: true, force: true });
@@ -872,7 +941,7 @@ describe("worktree.createSandbox()", () => {
       const sandbox = await ws.createSandbox({
         sandbox: testSandbox,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
 
@@ -902,7 +971,7 @@ describe("worktree.createSandbox()", () => {
       const sandbox = await ws.createSandbox({
         sandbox: testSandbox,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
 
@@ -933,7 +1002,7 @@ describe("worktree.createSandbox()", () => {
     const sandbox = await ws.createSandbox({
       sandbox: testSandbox,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -962,7 +1031,7 @@ describe("worktree.createSandbox()", () => {
       const sandbox1 = await ws.createSandbox({
         sandbox: testSandbox,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
       expect(sandbox1.branch).toBe("sequential-sandbox");
@@ -972,7 +1041,7 @@ describe("worktree.createSandbox()", () => {
       const sandbox2 = await ws.createSandbox({
         sandbox: testSandbox,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
       expect(sandbox2.branch).toBe("sequential-sandbox");

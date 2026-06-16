@@ -1,10 +1,6 @@
-import { Effect } from "effect";
+import { Clock, Duration, Effect, Option } from "effect";
 import { Display } from "./Display.js";
-import {
-  PromptError,
-  PromptExpansionTimeoutError,
-  withTimeout,
-} from "./errors.js";
+import { PromptError, PromptExpansionTimeoutError } from "./errors.js";
 import type { ExecError } from "./errors.js";
 import type { SandboxService } from "./SandboxFactory.js";
 
@@ -49,12 +45,11 @@ export const preprocessPrompt = (
   Display
 > => {
   const matches = [...prompt.matchAll(MARKED_SHELL_BLOCK_PATTERN)];
+  const promptExpansionTimeoutMs = resolvePromptExpansionTimeoutMs();
 
   if (matches.length === 0) {
     return Effect.succeed(prompt.replaceAll(SHELL_BLOCK_MARKER, ""));
   }
-
-  const promptExpansionTimeoutMs = resolvePromptExpansionTimeoutMs();
 
   return Effect.gen(function* () {
     const display = yield* Display;
@@ -64,27 +59,37 @@ export const preprocessPrompt = (
         const results = yield* Effect.all(
           matches.map((match) => {
             const command = match[1]!;
-            return Effect.flatMap(
-              sandbox.exec(command, { cwd }),
-              (execResult) =>
-                execResult.exitCode !== 0
-                  ? Effect.fail(
-                      new PromptError({
-                        message: `Command \`${command}\` exited with code ${execResult.exitCode}: ${execResult.stderr}`,
-                      }),
-                    )
-                  : Effect.succeed(execResult.stdout.trimEnd()),
-            ).pipe(
-              withTimeout(
-                promptExpansionTimeoutMs,
-                () =>
+            return Effect.gen(function* () {
+              const start = yield* Clock.currentTimeMillis;
+              const maybeResult = yield* sandbox
+                .exec(command, { cwd })
+                .pipe(
+                  Effect.timeoutOption(
+                    Duration.millis(promptExpansionTimeoutMs),
+                  ),
+                );
+              if (Option.isNone(maybeResult)) {
+                const elapsedMs = (yield* Clock.currentTimeMillis) - start;
+                return yield* Effect.fail(
                   new PromptExpansionTimeoutError({
-                    message: `Shell expression \`${command}\` timed out after ${promptExpansionTimeoutMs}ms`,
+                    message: `Shell expression \`${command}\` timed out after ${elapsedMs}ms`,
                     timeoutMs: promptExpansionTimeoutMs,
                     expression: command,
+                    elapsedMs,
                   }),
-              ),
-            );
+                );
+              }
+              const execResult = maybeResult.value;
+              if (execResult.exitCode !== 0) {
+                return yield* Effect.fail(
+                  new PromptError({
+                    message: `Command \`${command}\` exited with code ${execResult.exitCode}: ${execResult.stderr}`,
+                    exitCode: execResult.exitCode,
+                  }),
+                );
+              }
+              return execResult.stdout.trimEnd();
+            });
           }),
           { concurrency: "unbounded" },
         );

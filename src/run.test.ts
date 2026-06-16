@@ -22,17 +22,9 @@ import type { WorktreeInteractiveOptions } from "./createWorktree.js";
 import { defaultImageName } from "./sandboxes/docker.js";
 import * as sandcastle from "./SandboxProvider.js";
 import { createBindMountSandboxProvider } from "./SandboxProvider.js";
+import { testStubProvider } from "./sandboxes/test-shared.js";
 
-const testSandbox = createBindMountSandboxProvider({
-  name: "test",
-  create: async () => ({
-    worktreePath: "/home/agent/workspace",
-    exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-    copyFileIn: async () => {},
-    copyFileOut: async () => {},
-    close: async () => {},
-  }),
-});
+const testSandbox = testStubProvider({ name: "test" }).provider;
 
 describe("printFileDisplayStartup", () => {
   let consoleSpy: ReturnType<typeof vi.spyOn>;
@@ -231,6 +223,25 @@ describe("RunResult", () => {
       branch: "main",
     };
     expect(result.iterations[0]!.sessionFilePath).toBeUndefined();
+  });
+
+  it("allows fork as an optional sibling of resume on the type", () => {
+    // Compile-time shape check: fork takes (prompt, options?) and returns
+    // Promise<RunResult>, matching resume. Mirrors ADR 0018.
+    const result: RunResult = {
+      iterations: [{ sessionId: "abc-123" }],
+      completionSignal: undefined,
+      stdout: "",
+      commits: [],
+      branch: "main",
+      fork: async () => ({
+        iterations: [],
+        stdout: "",
+        commits: [],
+        branch: "main",
+      }),
+    };
+    expect(typeof result.fork).toBe("function");
   });
 });
 
@@ -436,6 +447,23 @@ describe("resumeSession validation", () => {
         resumeSession: "abc-123",
       }),
     ).rejects.toThrow('resumeSession "abc-123" not found');
+  });
+});
+
+describe("forkSession validation", () => {
+  it("throws when forkSession is set without resumeSession", async () => {
+    await expect(
+      run({
+        agent: claudeCode("claude-opus-4-7"),
+        sandbox: testSandbox,
+        prompt: "test",
+        branchStrategy: { type: "head" },
+        // forkSession is @internal; the user-facing surface is RunResult.fork().
+        // This guard exists so a caller setting the internal flag directly gets
+        // a clear error instead of a silently-ignored fork flag.
+        forkSession: true,
+      } as RunOptions),
+    ).rejects.toThrow("forkSession requires resumeSession");
   });
 });
 
@@ -1006,6 +1034,65 @@ describe("structured output entry-time validation", () => {
         output: Output.object({ tag: "answer", schema: mockSchema() }),
       }),
     ).rejects.toThrow("output tag <answer> not found in the resolved prompt");
+  });
+});
+
+describe("structured output error carries the failed session id", () => {
+  let consoleSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  // A sandbox whose agent invocation (the exec that receives `onLine`) streams
+  // a Claude Code init line carrying a session id, followed by a result line
+  // whose <result> tag holds malformed JSON. Extraction then fails and the
+  // session id must survive onto the thrown error.
+  const sessionEmittingSandbox = createBindMountSandboxProvider({
+    name: "session-emitting",
+    create: async () => ({
+      worktreePath: "/home/agent/workspace",
+      exec: async (
+        _command: string,
+        options?: { onLine?: (line: string) => void },
+      ) => {
+        if (options?.onLine) {
+          options.onLine(
+            '{"type":"system","subtype":"init","session_id":"sess-abc-123"}',
+          );
+          options.onLine(
+            '{"type":"result","result":"<result>not valid json</result>"}',
+          );
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+      copyFileIn: async () => {},
+      copyFileOut: async () => {},
+      close: async () => {},
+    }),
+  });
+
+  it("threads iterations[].sessionId onto StructuredOutputError", async () => {
+    // captureSessions: false keeps the session id from the stream without
+    // attempting to transfer a (nonexistent) session file off the sandbox.
+    try {
+      await run({
+        agent: claudeCode("claude-opus-4-7", { captureSessions: false }),
+        sandbox: sessionEmittingSandbox,
+        prompt: "emit your answer inside <result> tags",
+        branchStrategy: { type: "head" },
+        output: Output.object({ tag: "result", schema: mockSchema() }),
+      });
+      expect.unreachable("should have thrown StructuredOutputError");
+    } catch (err) {
+      expect(err).toBeInstanceOf(StructuredOutputError);
+      const soe = err as StructuredOutputError;
+      expect(soe.sessionId).toBe("sess-abc-123");
+      expect(soe.rawMatched).toBe("not valid json");
+    }
   });
 });
 

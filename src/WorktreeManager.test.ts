@@ -3,8 +3,10 @@ import { FileSystem } from "@effect/platform";
 import { NodeFileSystem } from "@effect/platform-node";
 import { exec } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
+  readFile,
   readdir,
   stat,
   symlink,
@@ -17,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import {
   create,
   generateTempBranchName,
+  getCurrentBranch,
   hasUncommittedChanges,
   pruneStale,
   remove,
@@ -56,6 +59,42 @@ const setupRepo = async () => {
   return repoDir;
 };
 
+/**
+ * Set up a main repo with an `origin` remote backed by a bare repo. Returns
+ * both the repo dir (with `origin` configured) and a `pushOrigin` helper that
+ * makes a fresh commit on `branch` in a separate clone and pushes it — used to
+ * simulate someone else moving origin forward between sandcastle runs.
+ */
+const setupRepoWithOrigin = async () => {
+  const remoteDir = await mkdtemp(join(tmpdir(), "wt-remote-"));
+  await execAsync("git init --bare -b main", { cwd: remoteDir });
+
+  const repoDir = await mkdtemp(join(tmpdir(), "wt-repo-"));
+  await initRepo(repoDir);
+  await commitFile(repoDir, "hello.txt", "hello", "initial commit");
+  await execAsync(`git remote add origin "${remoteDir}"`, { cwd: repoDir });
+  await execAsync("git push -u origin main", { cwd: repoDir });
+
+  const pushOrigin = async (
+    branch: string,
+    fileName: string,
+    content: string,
+    message: string,
+  ) => {
+    const cloneDir = await mkdtemp(join(tmpdir(), "wt-clone-"));
+    await execAsync(`git clone "${remoteDir}" .`, { cwd: cloneDir });
+    await execAsync('git config user.email "test@test.com"', {
+      cwd: cloneDir,
+    });
+    await execAsync('git config user.name "Test"', { cwd: cloneDir });
+    await execAsync(`git checkout ${branch}`, { cwd: cloneDir });
+    await commitFile(cloneDir, fileName, content, message);
+    await execAsync(`git push origin ${branch}`, { cwd: cloneDir });
+  };
+
+  return { repoDir, remoteDir, pushOrigin };
+};
+
 /** Run an Effect and return its success value, throwing on failure. */
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
   Effect.runPromise(
@@ -92,9 +131,9 @@ describe("sanitizeName", () => {
 });
 
 describe("generateTempBranchName", () => {
-  it("returns a string in sandcastle/<YYYYMMDD-HHMMSS> format", () => {
+  it("returns a string in sandcastle/<YYYYMMDD-HHMMSS>-<random> format", () => {
     const name = generateTempBranchName();
-    expect(name).toMatch(/^sandcastle\/\d{8}-\d{6}$/);
+    expect(name).toMatch(/^sandcastle\/\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 
   it("returns different names when called at different times", async () => {
@@ -104,14 +143,20 @@ describe("generateTempBranchName", () => {
     expect(a).not.toBe(b);
   });
 
+  it("returns different names when called within the same second (random suffix)", () => {
+    const names = new Set<string>();
+    for (let i = 0; i < 16; i++) names.add(generateTempBranchName());
+    expect(names.size).toBe(16);
+  });
+
   it("includes sanitized name when provided", () => {
     const name = generateTempBranchName("my-run");
-    expect(name).toMatch(/^sandcastle\/my-run\/\d{8}-\d{6}$/);
+    expect(name).toMatch(/^sandcastle\/my-run\/\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 
   it("sanitizes the name in the branch", () => {
     const name = generateTempBranchName("My Run!");
-    expect(name).toMatch(/^sandcastle\/my-run-\/\d{8}-\d{6}$/);
+    expect(name).toMatch(/^sandcastle\/my-run-\/\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 });
 
@@ -131,22 +176,22 @@ describe("WorktreeManager.create", () => {
     expect(branch.length).toBeGreaterThan(0);
   });
 
-  it("creates a sandcastle/<timestamp> branch when no branch is specified", async () => {
+  it("creates a sandcastle/<timestamp>-<random> branch when no branch is specified", async () => {
     const repoDir = await setupRepo();
     const { branch } = await run(create(repoDir));
-    expect(branch).toMatch(/^sandcastle\/\d{8}-\d{6}$/);
+    expect(branch).toMatch(/^sandcastle\/\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 
   it("includes name in branch when name is specified", async () => {
     const repoDir = await setupRepo();
     const { branch } = await run(create(repoDir, { name: "my-run" }));
-    expect(branch).toMatch(/^sandcastle\/my-run\/\d{8}-\d{6}$/);
+    expect(branch).toMatch(/^sandcastle\/my-run\/\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 
   it("includes name in worktree directory when name is specified", async () => {
     const repoDir = await setupRepo();
     const { path } = await run(create(repoDir, { name: "my-run" }));
-    expect(path).toMatch(/sandcastle-my-run-\d{8}-\d{6}$/);
+    expect(path).toMatch(/sandcastle-my-run-\d{8}-\d{6}-[0-9a-f]{6}$/);
   });
 
   it("checks out the specified branch when branch is given", async () => {
@@ -311,6 +356,226 @@ describe("WorktreeManager.create", () => {
     expect(worktreeHead.trim()).toBe(branchHead.trim());
 
     await run(remove(path));
+  });
+
+  it("fast-forwards a clean reused worktree when origin has moved ahead", async () => {
+    const { repoDir, pushOrigin } = await setupRepoWithOrigin();
+
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "x.txt", "x", "branch commit");
+    await execAsync("git push -u origin my-branch", { cwd: repoDir });
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+    const { stdout: initialSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    // Someone else pushes a new commit to origin/my-branch
+    await pushOrigin("my-branch", "new.txt", "new", "new origin commit");
+
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+
+    expect(second.path).toBe(first.path);
+    expect(second.branch).toBe("my-branch");
+
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).not.toBe(initialSha.trim());
+    // The pushed file should now exist in the worktree
+    const newFile = await readFile(join(second.path, "new.txt"), "utf-8");
+    expect(newFile).toBe("new");
+
+    await run(remove(first.path));
+  });
+
+  it("preserves unpushed commits when the reused branch has diverged from origin", async () => {
+    const { repoDir, pushOrigin } = await setupRepoWithOrigin();
+
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "x.txt", "x", "branch commit");
+    await execAsync("git push -u origin my-branch", { cwd: repoDir });
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+
+    // Add an unpushed commit in the worktree
+    await commitFile(first.path, "local.txt", "local", "local-only commit");
+    const { stdout: localSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    // Also push a different new commit to origin → true divergence
+    await pushOrigin("my-branch", "remote.txt", "remote", "remote-only commit");
+
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+
+    expect(second.path).toBe(first.path);
+
+    // The local commit must survive — no clobber by reset --hard or similar.
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).toBe(localSha.trim());
+    const localFile = await readFile(join(second.path, "local.txt"), "utf-8");
+    expect(localFile).toBe("local");
+
+    await run(remove(first.path));
+  });
+
+  it("does not refresh a dirty reused worktree", async () => {
+    const { repoDir, pushOrigin } = await setupRepoWithOrigin();
+
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "x.txt", "x", "branch commit");
+    await execAsync("git push -u origin my-branch", { cwd: repoDir });
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+    const { stdout: initialSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    // Dirty the worktree with an uncommitted change
+    await writeFile(join(first.path, "dirty.txt"), "uncommitted");
+
+    // Origin moves forward — but because the worktree is dirty, refresh
+    // should be skipped so the uncommitted change isn't disturbed.
+    await pushOrigin("my-branch", "new.txt", "new", "new origin commit");
+
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+
+    expect(second.path).toBe(first.path);
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).toBe(initialSha.trim());
+    // The uncommitted file is still there
+    const dirty = await readFile(join(second.path, "dirty.txt"), "utf-8");
+    expect(dirty).toBe("uncommitted");
+
+    await run(remove(first.path));
+  });
+
+  it("treats fetch failure as non-fatal and reuses the worktree as-is", async () => {
+    // No origin remote at all — `git fetch origin <branch>` will fail.
+    const repoDir = await setupRepo();
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "x.txt", "x", "branch commit");
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+    const { stdout: initialSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    // Reuse must not throw — the fetch failure is swallowed.
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+
+    expect(second.path).toBe(first.path);
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).toBe(initialSha.trim());
+
+    await run(remove(first.path));
+  });
+
+  it("preserves unpushed local commits when origin has not moved (ff-only no-op)", async () => {
+    // Strictly-ahead case: origin/<branch> is an ancestor of HEAD. `git merge
+    // --ff-only` must succeed as a no-op and leave the unpushed commit intact.
+    // Distinct from the no-origin path: here fetch *succeeds* and the merge
+    // call actually runs.
+    const { repoDir } = await setupRepoWithOrigin();
+
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "x.txt", "x", "branch commit");
+    await execAsync("git push -u origin my-branch", { cwd: repoDir });
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+
+    // Local commit; origin/my-branch stays put.
+    await commitFile(first.path, "local.txt", "local", "local-only commit");
+    const { stdout: localSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+
+    expect(second.path).toBe(first.path);
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).toBe(localSha.trim());
+    const localFile = await readFile(join(second.path, "local.txt"), "utf-8");
+    expect(localFile).toBe("local");
+
+    await run(remove(first.path));
+  });
+
+  it("does not advance HEAD past a mid-rebase pause (detached HEAD, clean tree)", async () => {
+    // A `git rebase` paused at an `edit`/`break`/`exec` instruction leaves
+    // HEAD detached at the pause point with a clean working tree — porcelain
+    // status is empty, so the dirty guard does not catch it. Without an
+    // explicit HEAD-attached check, `git merge --ff-only origin/<branch>`
+    // would silently advance HEAD past the pause point and `git rebase
+    // --continue` would then produce confused "empty cherry-pick" output.
+    const { repoDir, pushOrigin } = await setupRepoWithOrigin();
+
+    await execAsync("git checkout -b my-branch", { cwd: repoDir });
+    await commitFile(repoDir, "a.txt", "a", "branch commit 1");
+    await commitFile(repoDir, "b.txt", "b", "branch commit 2");
+    await execAsync("git push -u origin my-branch", { cwd: repoDir });
+    await execAsync("git checkout main", { cwd: repoDir });
+
+    const first = await run(create(repoDir, { branch: "my-branch" }));
+
+    // Pause the rebase mid-way: `--exec false` runs `false` after each
+    // cherry-pick, fails on the first one, and leaves HEAD detached with a
+    // clean working tree and a populated `rebase-merge` state directory.
+    await execAsync("git rebase --exec false HEAD~2", {
+      cwd: first.path,
+    }).catch(() => {});
+
+    const { stdout: pausedSha } = await execAsync("git rev-parse HEAD", {
+      cwd: first.path,
+    });
+
+    // Sanity: HEAD must actually be detached and the tree clean — the
+    // preconditions for the bug.
+    await expect(
+      execAsync("git symbolic-ref --quiet HEAD", { cwd: first.path }),
+    ).rejects.toThrow();
+    const { stdout: status } = await execAsync("git status --porcelain", {
+      cwd: first.path,
+    });
+    expect(status.trim()).toBe("");
+
+    // Move origin forward so the buggy code would have something to ff to.
+    await pushOrigin("my-branch", "new.txt", "new", "new origin commit");
+
+    const second = await run(create(repoDir, { branch: "my-branch" }));
+    expect(second.path).toBe(first.path);
+
+    const { stdout: afterSha } = await execAsync("git rev-parse HEAD", {
+      cwd: second.path,
+    });
+    expect(afterSha.trim()).toBe(pausedSha.trim());
+
+    // Rebase state must survive — `--continue` would otherwise be impossible.
+    const { stdout: rebaseMergePath } = await execAsync(
+      "git rev-parse --git-path rebase-merge",
+      { cwd: second.path },
+    );
+    const resolvedRebaseDir = rebaseMergePath.trim().startsWith("/")
+      ? rebaseMergePath.trim()
+      : join(second.path, rebaseMergePath.trim());
+    expect((await stat(resolvedRebaseDir)).isDirectory()).toBe(true);
+
+    await execAsync("git rebase --abort", { cwd: first.path }).catch(() => {});
+    await run(remove(first.path));
   });
 
   it("reuses worktree with unpushed commits (not considered dirty)", async () => {
@@ -574,5 +839,46 @@ describe("WorktreeManager.hasUncommittedChanges", () => {
     expect(result).toBe(true);
 
     await run(remove(path));
+  });
+});
+
+describe("WorktreeManager git locale", () => {
+  // Regression for #595: this module matches git's stderr (e.g. "invalid
+  // reference") to decide control flow. git localizes those strings via
+  // gettext, so in a non-English locale the matches silently fail and worktree
+  // creation breaks. execGit must force LC_ALL=C so git always emits English.
+  //
+  // No non-English locale is installed on CI, so git would emit English
+  // regardless and a plain behavioral test could not fail. Instead we shadow
+  // the real `git` binary with a shim that records the LC_ALL it received,
+  // asserting the module invokes git in the C locale even when the parent
+  // process is set to a different one.
+  it("invokes git with LC_ALL=C even when the process locale is non-English", async () => {
+    if (process.platform === "win32") return; // POSIX shell shim
+    const repoDir = await setupRepo();
+    const shimDir = await mkdtemp(join(tmpdir(), "wt-git-shim-"));
+    const logPath = join(shimDir, "lc_all.log");
+    const gitShim = join(shimDir, "git");
+    await writeFile(
+      gitShim,
+      `#!/bin/sh\nprintf '%s' "\${LC_ALL-}" > "${logPath}"\necho main\n`,
+    );
+    await chmod(gitShim, 0o755);
+
+    const originalPath = process.env.PATH;
+    const originalLcAll = process.env.LC_ALL;
+    process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+    process.env.LC_ALL = "en_US.UTF-8";
+    try {
+      const branch = await run(getCurrentBranch(repoDir));
+      expect(branch).toBe("main");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalLcAll === undefined) delete process.env.LC_ALL;
+      else process.env.LC_ALL = originalLcAll;
+    }
+
+    expect(await readFile(logPath, "utf8")).toBe("C");
   });
 });

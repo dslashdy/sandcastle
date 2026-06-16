@@ -1,5 +1,150 @@
 # @ai-hero/sandcastle
 
+## 0.9.0
+
+### Minor Changes
+
+- 47184de: Capture Claude Code subagent / workflow session transcripts to the host alongside the main session. Previously only the main `<sessionId>.jsonl` was copied off the sandbox; transcripts written by the `Agent` tool and the `Workflow` tool under `<sessionId>/subagents/agent-*.jsonl` were lost on teardown. They are now captured with the same sandbox→host `cwd` rewrite. Failure to capture an individual subagent transcript is best-effort and logs a warning; the main session capture remains fatal on failure.
+
+### Patch Changes
+
+- 86aec83: `sandcastle init` now scaffolds `CLAUDE_CODE_OAUTH_TOKEN=` (with a commented `ANTHROPIC_API_KEY=` fallback) for the Claude Code agent, and the next-steps copy points users at `claude setup-token` instead of the closed issue #191.
+- 03dcc25: Guard `substitutePromptArgs` against `undefined`/`null` values in `promptArgs`. Previously, a present-but-nullish value (e.g. `{ TITLE: undefined }` from an orchestrator's `JSON.parse` output) bypassed the existence check and crashed with an unguarded `TypeError` on `.toString()`. Now surfaces a clean `PromptError` naming the offending key. `findMissingPromptArgKeys` also treats present-but-nullish values as missing, so the interactive prompt-fill flow asks the user to supply the value rather than failing through.
+
+## 0.8.0
+
+### Minor Changes
+
+- cf92a17: Add `permissionMode` to `claudeCode()` and `approvalsReviewer` to `codex()` — provider-level options for AI-mediated per-tool approval, an alternative to full bypass for AFK host runs (`noSandbox()` + `run()`).
+
+  `claudeCode({ permissionMode: "auto" })` emits `--permission-mode auto` instead of `--dangerously-skip-permissions`. Accepts any of Claude's permission modes: `default`, `acceptEdits`, `plan`, `auto`, `dontAsk`, `bypassPermissions`.
+
+  `codex({ approvalsReviewer: "auto_review" })` swaps `--dangerously-bypass-approvals-and-sandbox` for `-a on-request -s danger-full-access -c approvals_reviewer="auto_review"` so Codex's reviewer agent evaluates each approval prompt.
+
+### Patch Changes
+
+- 932302b: Bump the Codex default model from `gpt-5.4-mini` to `gpt-5.4` in `sandcastle init` scaffolding and the interactive agent picker. The previous default was underpowered for implementation work.
+- c6c3026: Fix `opencode()` interactive sessions (and the `init` scaffold's opencode `setupCommand`) seeding the prompt with `-p`, which is the `opencode run`/`attach` basic-auth password flag, not a prompt seed. Use `--prompt` (the TUI's long-form-only seed flag) instead. The TUI pre-fills the textbox but does not auto-submit (see [sst/opencode#3937](https://github.com/sst/opencode/issues/3937)).
+
+## 0.7.0
+
+### Minor Changes
+
+- 22113ca: `sandcastle init` now supports fully non-interactive setup. Every interactive prompt has a paired CLI flag (`--issue-tracker`, `--create-label`, `--build-image`, `--install-template-deps`) on top of the existing `--agent` / `--template` / `--sandbox` / `--model` / `--image-name`. When stdin is not a TTY and a flag is missing for a prompt that would otherwise fire, init fails fast with a message naming the missing flag instead of crashing on the prompt library.
+
+### Patch Changes
+
+- 0b397a1: Strengthen the `simple-loop` and `sequential-reviewer` prompts so an empty pre-expanded `LIST_TASKS_COMMAND` result is treated as ground truth, not as a stale snapshot. The "do not re-query" hint now frames the filtered list as the sole source of truth, and the `# Done` completion criterion explicitly equates an empty list with completion. Prevents the agent from running its own unfiltered `gh issue list` when the filtered list is `[]`.
+- c6880a4: Fix `createSandbox` (and `createWorktree`) reusing a stale worktree when called twice for the same named branch. A reused worktree holds a local copy of the branch that never moves on its own, so a re-run loop (review → push fixes → re-run) was reading stale code even though `origin/<branch>` had moved ahead.
+
+  On the **clean** worktree-reuse path of the **branch** strategy, sandcastle now runs `git fetch origin <branch>` followed by `git merge --ff-only origin/<branch>` so the worktree picks up new upstream commits. The refresh only runs when it is provably safe — clean tree and strictly behind origin. **Dirty**, **diverged** (unpushed commits), or **fetch fails** (offline) → skip the refresh, reuse as-is, log why. Fetch failure is non-fatal and never breaks the run. First creation, the merge-to-head strategy, and the head strategy are untouched. See ADR 0003 for the full rationale.
+
+## 0.6.6
+
+### Patch Changes
+
+- ddc26ba: Add `completionTimeoutSeconds` to handle agents that emit the completion signal but never exit. When an agent prints `<promise>COMPLETE</promise>` (or any configured `completionSignal`) but a child process it spawned — a `gh`/git subprocess, a long-lived MCP server, etc. — keeps the exec's stdout pipe open, the parent never reaches EOF. Previously the run waited the full `idleTimeoutSeconds` (default 10 minutes) before failing with `AgentIdleTimeoutError`, discarding any commits the agent had already made. The orchestrator now scans buffered output as it streams, and once a completion signal is detected it swaps the idle timer for a shorter **completion timeout** (default 60 seconds). On expiry the iteration resolves successfully with a warning, `result.commits` and `result.completionSignal` are populated, and session capture runs as normal. The timer resets on every subsequent output line so trailing data (Codex `turn.completed` usage, Claude Code terminal `result`, structured-output tags emitted after the marker) is still captured. A clean process exit always wins the race, so healthy runs gain zero added latency. The new `completionTimeoutSeconds` option (also accepted by `createSandbox()` and `createWorktree()` runs) tunes the window; it is independent of `idleTimeoutSeconds` and is not clamped against it. See ADR 0019.
+- e078db5: `Sandbox.run()` (from `createSandbox()`) and `Worktree.run()` (from `createWorktree()`) now emit the run-complete status line and the `Context window: NNNk` line for each iteration with usage data, mirroring the behaviour of the top-level `run()` entry point. Previously these lines only showed up from `run()`, so callers using the lower-level wrappers never saw the completion status or token-count summaries even when usage was available.
+- 932aa70: Add resume support to the `pi()` agent provider. Pi sessions captured during a run can now be continued via `RunResult.resume(prompt)` or `run({ resumeSession: "<id>" })`, mirroring Claude Code and Codex. Pi's JSONL session under `~/.pi/agent/sessions/--<encoded-cwd>--/<timestamp>_<id>.jsonl` is captured to the host with its header `cwd` rewritten and resumed back into the sandbox via `pi --session <id>`. Session capture defaults to on; opt out with `pi("model", { captureSessions: false })`. Pi's print-mode `--no-session` flag is no longer hard-coded so iterations are persisted by default.
+- 1201b4d: Add a `thinking` option to the `pi()` agent provider. Pass `pi("model", { thinking: "high" })` to forward `--thinking <level>` to the pi CLI. Accepted levels: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`.
+- b9b9712: Add typed diagnostics to prompt-expansion errors so a downstream orchestrator can branch on them programmatically instead of parsing the message. `PromptExpansionTimeoutError` now carries `elapsedMs` (the wall-clock time the shell expression actually ran before timing out, measured at the throw site) alongside the existing `timeoutMs`; `PromptError` carries an optional `exitCode` when the failure was a non-zero exit from a `` !`command` `` expansion. Both values are reflected in the formatted error message so a human reading the log can tell a 30s contention timeout from an instant auth failure. Follows ADR-0020 (fail-fast prompt expansion); no retry behaviour changes.
+- 72637ae: Replace the `SessionStore`-based public API with pure JSONL transfer helpers. The previous `hostSessionStore`, `sandboxSessionStore`, `codexHostSessionStore`, `codexSandboxSessionStore` exports and the `SessionStore` type were the implementation seam used internally to read/write agent session files. They are now removed in favour of pure-string helpers — `transferClaudeSession(jsonl, fromCwd, toCwd)` and `transferCodexSession(jsonl, fromCwd, toCwd)` — that rewrite a session JSONL without touching the filesystem. Path helpers (`claudeHostSessionPath`, `claudeSandboxSessionPath`, `encodeProjectPath`) and the host-side scan utilities (`findClaudeSessionOnHost`, `findCodexSessionOnHost`, `HostSessionLookup`) are exposed instead, so callers building a custom `AgentSessionStorage` do their own file I/O at the call site. The built-in `claudeCode()` and `codex()` providers are unchanged for end users — only direct consumers of the removed store factories need to migrate.
+- 58f335f: Add `RunResult.fork(prompt, options?)` as the sibling of `RunResult.resume()` for fan-out workflows. Both run exactly one iteration that continues from the last captured agent session, but `.fork()` leaves the parent session JSONL intact and writes the child under a new session id — the underlying mechanism is `claude --resume <id> --fork-session` for Claude Code and `codex exec fork <id>` for Codex. `fork` is present only on results from providers with `sessionStorage` (Claude Code, Codex).
+
+  Fork isolates the agent session only — not the branch, worktree, or sandbox. Safe concurrent fan-out (`Promise.all([r.fork(a), r.fork(b)])`) requires giving each child a distinct branch via `branchStrategy: { type: "branch", branch: "..." }`; the default `head` and `merge-to-head` strategies are not safe for concurrent forks. See ADR 0018 for the design rationale and the fan-out caveat.
+
+  Also: `generateTempBranchName` now appends a 6-hex-char random suffix to its `sandcastle/<YYYYMMDD-HHMMSS>` format. The previous second-granularity timestamp collided under any concurrent invocation, not just fork.
+
+- b46dae7: Fix `syncOut` failing on the second run against the same isolated sandbox. `git am` rewrites SHAs on the host, so on every run after the first the previous host `HEAD` was unknown to the sandbox and `git format-patch hostHead..HEAD` aborted with `fatal: Invalid revision range`, losing the run's commits when the sandbox was torn down.
+
+  `syncOut` now tracks the last-synced commit in a sandbox-owned ref `refs/sandcastle/sync-base` and uses it as the patch base, falling back to host `HEAD` only when the ref is absent (run 1). The same ref is read by `SandboxLifecycle` via the new exported `countCommitsToSync` helper, fixing the related "No commits to sync out" misreport on run 2+. See ADR 0017.
+
+## 0.6.5
+
+### Patch Changes
+
+- 0b2ec99: Detect the host package manager (npm, pnpm, yarn, or bun) during `sandcastle init` and use it for the install commands shown in the next steps. For templates that import `zod` on the host (the planner templates), init now offers to install it with the detected package manager when it isn't already declared — preventing the `ERR_MODULE_NOT_FOUND: Cannot find package 'zod'` crash on the first run.
+
+## 0.6.4
+
+### Patch Changes
+
+- 157dafc: Add a hint to the `sequential-reviewer` and `simple-loop` implement prompts noting that the issue list is already filtered and discouraging an unfiltered re-query, so the agent is less likely to bypass the configured label filter when the list is empty.
+
+## 0.6.3
+
+### Patch Changes
+
+- 1a7e2f5: Add a "Custom" issue tracker option to `sandcastle init`. Selecting it scaffolds the project in a deliberately broken-until-configured state plus a `.sandcastle/SETUP_ISSUE_TRACKER.md` prompt you feed to your coding agent, which wires up your own issue tracker by editing the scaffolded files in place. Init skips the image build for this option (the Dockerfile is intentionally unfinished) and prints a per-agent setup command in the next steps.
+- 8f79a12: Use the scoped package name (`@ai-hero/sandcastle`) in the quick-start docs so `npx` resolves this package rather than the unrelated unscoped `sandcastle` package on npm. Also refresh the docs site getting-started page, which referenced removed `sandcastle init`/`sandcastle run` commands.
+- b7595bc: Rename the "backlog manager" concept to "issue tracker" across `sandcastle init` — the selection prompt now reads "Select an issue tracker:", and the generated Dockerfile placeholder is `{{ISSUE_TRACKER_TOOLS}}`. Pure rename with no behaviour change.
+
+## 0.6.2
+
+### Patch Changes
+
+- b141975: The `codex()` agent provider now surfaces per-iteration token usage from its `turn.completed` stream events, so the `Context window: NNNk` line is reported for Codex runs (previously only Claude Code). Codex's `{ input_tokens, cached_input_tokens, output_tokens }` shape is mapped onto Sandcastle's usage model with the cached portion counted as cache-read tokens, avoiding double-counting in the display. Usage flows directly from the stream, so it works even when session capture is disabled or there is no bind-mount.
+
+## 0.6.1
+
+### Patch Changes
+
+- e2c5431: `copilot()` agent provider now parses the `copilot --output-format json` JSONL stream. Text deltas (`assistant.message_delta`), `bash` tool calls (`tool.execution_start`), the final assistant message (`assistant.message`), and the session id (terminal `result` event) are surfaced as `StreamEvent`s, so the Orchestrator's `result.stdout`, `logging.onAgentStreamEvent` timeline, and stderr-empty error fallback now work for Copilot the same as they do for Claude Code, Codex, and Pi. Previously `parseStreamLine` was a no-op.
+- d0afa21: Make planner branch names deterministic. The parallel-planner and parallel-planner-with-review templates previously asked the agent to assign a branch name in the format `sandcastle/issue-{id}-{slug}`, where the slug was re-derived on every planning iteration. Because each iteration runs a fresh agent, this produced a different branch each time, forking new branches off HEAD and discarding accumulated progress. The format is now the deterministic `sandcastle/issue-{id}`, so re-planning the same issue resumes the existing branch.
+- abac106: Fix `resumeSession` precheck false-negative for the no-sandbox provider. When running on the host with no sandbox, the agent writes its session in place under a cwd-derived directory that Sandcastle was reconstructing from the host repo path — missing the worktree path, symlink-resolved paths (e.g. macOS `/tmp` → `/private/tmp`), and the agent's `.`→`-` encoding. The precheck now locates the session by its unique id via a new `findByIdOnHost` capability on `AgentSessionStorage`, so no-sandbox resume works regardless of how the agent encodes its cwd. Sandboxed (docker/podman) runs are unchanged.
+- f34bf0a: Add a `copilot` agent provider for [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli) (`@github/copilot`). Use it like the other agent factories: `copilot("claude-sonnet-4.5")`. Authentication is via `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`. `sandcastle init` now offers GitHub Copilot CLI as an agent option, with a Dockerfile that installs the CLI via `npm install -g @github/copilot`.
+- 6bcaa7a: The `parallel-planner` and `parallel-planner-with-review` init templates now parse the planner's `<plan>` output with `Output.object` and a Zod schema instead of a bespoke regex helper. The templates depend on Zod, but any [Standard Schema](https://standardschema.dev) validator (Valibot, ArkType, …) works; `sandcastle init` now reminds you to install one. A missing tag or malformed plan JSON now throws `StructuredOutputError`.
+- f64e203: Fix the `sequential-reviewer` template processing the entire backlog in a single pass: the implementer now runs for one iteration so each outer loop handles one issue on its own branch, and the loop stops once the backlog is exhausted. Also fix the empty review diff in both `sequential-reviewer` and `parallel-planner-with-review` templates — `review-prompt.md` now diffs the branch against `{{TARGET_BRANCH}}` (the fork point) instead of `{{SOURCE_BRANCH}}`, which equals the branch itself and always produced an empty diff.
+- 6165660: Share a single `SIGINT`/`SIGTERM`/`exit` handler across sandboxes. Previously every `createSandbox()`, `docker()`, and `podman()` sandbox added its own process signal listeners, so running more than ~5 concurrent sandboxes tripped Node's `MaxListenersExceededWarning`. Cleanup now routes through one shared registry that installs a single listener per event and fans out to each sandbox's teardown.
+
+  Behavior change on interrupt: with a Docker/Podman sandbox, the container's signal handler used to call `process.exit` before `createSandbox()`'s handler ran, so the "Worktree preserved" recovery guidance was silently skipped. The shared handler runs every teardown (container removal **and** the guidance) before exiting once with code 1, so the guidance now prints on `Ctrl-C`.
+
+- 46eb483: Fix worktree creation failing under non-English git locales. `WorktreeManager` matched git's human-readable stderr (e.g. "invalid reference") to decide control flow, but git localizes those strings, so in a non-English locale the new-branch fallback never fired and worktree creation broke outright. Git is now invoked with `LC_ALL=C` so its messages are always English and machine-stable.
+
+## 0.6.0
+
+### Minor Changes
+
+- bc9216f: Add a `cursor()` agent provider. Cursor is selectable during `sandcastle init` (with a provider-specific Dockerfile and `CURSOR_API_KEY` env scaffold) and importable directly as `cursor(model, options?)`. Print mode runs the Cursor Agent CLI with `--output-format stream-json`, passing the prompt as a positional argument (guarded against the argv size limit) and parsing Cursor's top-level `tool_call` events. Cursor is non-resumable (no filesystem-backed session storage), consistent with ADR 0012/0016.
+
+### Patch Changes
+
+- 8562a7e: Fix the Beads `CLOSE_TASK_COMMAND` template, which passed the completion message as a positional argument (`bd close <ID> "Completed by Sandcastle"`). `bd close` parsed it as a second issue ID and errored. It now uses the `--reason=` flag.
+- 825aadf: Fix `RangeError: Invalid string length` crash on long agent runs. When streaming `exec` output via `onLine`, sandbox providers accumulated every line and joined them into one string at completion; past V8's ~512MB max string length this threw inside a `close` event handler — an uncaught exception that bypassed `Promise.allSettled` and took down the whole run, including parallel pipelines. Streamed stdout and stderr are now kept in a bounded rolling tail (default 64KiB, configurable per provider via `maxOutputTailChars`). Live output to `onLine` is unaffected.
+- 73e9e7c: Add `"xhigh"` to the `ClaudeCodeOptions.effort` union to match the Claude CLI's `--effort` levels.
+- 746e0ca: Add resume support for the Codex agent provider and move session storage behind provider-owned session stores.
+
+  The per-provider session transfer is now owned by the provider's `sessionStorage.transfer` (ADR 0012). The free `transferSession` export is removed from the public API — agent providers apply their own format-specific `cwd` rewriting internally.
+
+- 2318bb4: Add a `devices` option to the Docker and Podman sandbox providers that maps to `--device` flags, exposing host devices to the container (e.g. `/dev/kvm`). Each entry is a full device spec in `host[:container[:permissions]]` form; when omitted, no `--device` flags are added. SELinux `--security-opt` handling is intentionally out of scope and left to the user.
+- c878b14: Add a `cpus` option to the Docker and Podman sandbox providers that maps to the `--cpus` flag on `docker run` / `podman run`, limiting the CPU resources available to the container. Accepts fractional values (e.g. `1.5`); when omitted, the container is left unconstrained.
+- b233f40: Expose more sandbox lifecycle timeouts via the `Timeouts` interface. In addition to `copyToWorktreeMs`, you can now override `gitSetupMs` (in-sandbox git setup commands, default 10 000 ms), `commitCollectionMs` (collecting the run's commits, default 30 000 ms), and `mergeToHostMs` (merging a temp branch back to the host branch, default 30 000 ms). These are accepted anywhere `timeouts` already is — `run()`, `createSandbox()`, `interactive()`, and `createWorktree()`. Unset keys keep their defaults.
+- 702c761: Fix `sandcastle init` ignoring the selected sandbox provider in the generated main file. Choosing Podman now rewrites the `docker` import and `docker()` call sites to `podman`, instead of always scaffolding `docker`.
+- 18ae734: Expand the generated `.env.example` comment for `GH_TOKEN` (GitHub Issues backlog manager) to link the fine-grained token creation page and list the required repository permissions: Issues (Read and write) and Metadata (Read).
+- 15d70ef: Add a `groups` option to the Docker and Podman sandbox providers that maps to `--group-add` flags, granting the container user supplementary group membership (e.g. for a bind-mounted Docker socket). Accepts group names or numeric GIDs; when omitted, no `--group-add` flags are added.
+- cd5fd13: Fix `sandcastle docker build-image` / `podman build-image` failing on macOS hosts. The generated Dockerfile now aligns the agent UID/GID with `groupmod -o` / `usermod -o` (`--non-unique`), so a host GID that collides with a reserved GID in `node:22-bookworm` (notably macOS's primary group `staff` = GID 20, occupied by `dialout`) no longer aborts the build with `GID '20' already exists`. Existing scaffolds need to re-run `sandcastle init` or add `-o` to the `groupmod`/`usermod` line by hand.
+- f1d5ddc: Fix worktree management on Windows by normalizing path separators. `git worktree list` reports paths with forward slashes even on Windows, while `node:path.join` uses backslashes — so `create()` would misclassify a reusable managed worktree as an external one and throw "already checked out", and `pruneStale()` would treat every active worktree as orphaned and delete it out from under running sandboxes. Path comparisons now normalize separators before matching.
+- bca035e: Add an `agent` option to `opencode()`, mapping to OpenCode's own `--agent` flag (e.g. `opencode("model", { agent: "build" })`). It selects a named agent/mode inside OpenCode for both headless (`run`) and interactive invocations, and is distinct from Sandcastle's `--agent` provider selector.
+- 1e23181: Fix dropped OpenCode output. The print command now passes `--format json` so OpenCode emits the structured event stream the parser consumes — previously it emitted plain text, so the parser received nothing and live output, tool calls, and the session ID were all dropped. `--dangerously-skip-permissions` is now passed in the sandbox so runs no longer hang on permission prompts. `parseStreamLine` surfaces assistant text and the final result from `text` events, tool calls from `tool_use` events (`bash`, `webfetch`, `task`, with a JSON fallback for other tools, gated on the completed status), the session ID from `step_start`, and error messages from `error` events.
+- a3f1c04: Fix orphaned worktrees when sandbox start fails (e.g. a missing Docker image). `run()`, `createSandbox()`, and `interactive()` now remove the freshly-created worktree if any setup step after worktree creation fails, instead of leaving it behind to require a manual `git worktree remove --force`. Covers all three worktree-creating branch strategies for bind-mount, isolated, and no-sandbox providers.
+- 0b74ab6: Raise the GitHub Issues backlog manager's list command to `--limit 100` so the parallel planner sees the full backlog instead of `gh`'s default 30, preventing foundation issues from being silently truncated out of the dependency graph.
+- fbad1a4: Retry transient git setup exec failures during `withSandboxLifecycle`. Under heavy parallelism the `git config` / `git rev-parse` commands run at sandbox start could fail with exit 126 (`cannot exec`) or 137 (killed) from a momentary container exec race rather than a real git error. These are now retried (each attempt still bounded by the existing per-command timeout); genuine non-transient git failures and hangs still fail fast. `ExecError` also gains an optional `exitCode` field carrying the failing command's exit code.
+- 8aee234: Add a `--sandbox` flag to `sandcastle init` to select the sandbox provider (`docker` or `podman`) non-interactively, mirroring `--agent`.
+- 87285a7: Fix `syncOut` deleting the entire `.sandcastle` directory after a successful sync. Cleanup of temporary patch artifacts removed the whole `.sandcastle` directory once `patches/` was empty, wiping tracked files (e.g. `Dockerfile`, config) from the synced worktree. It now removes only the `patches/` directory.
+
+## 0.5.12
+
+### Patch Changes
+
+- 581dc80: `StructuredOutputError` now carries `sessionId` and `sessionFilePath` from the run that produced the failed output, so callers can resume that session with feedback to re-emit corrected output instead of repeating the work.
+
+## 0.5.11
+
+### Patch Changes
+
+- 5ac972a: Bump default Claude Code model from `claude-opus-4-6` to `claude-opus-4-7`.
+- 7cefd7c: Allow `noSandbox()` in `run()` and `createSandbox()`. Previously it was only accepted by `interactive()`. Use this when running Sandcastle from inside an already-isolated environment (containerized CI, VM, sandbox host) and you want the agent to operate directly on the host without a nested container.
+
 ## 0.5.10
 
 ### Patch Changes

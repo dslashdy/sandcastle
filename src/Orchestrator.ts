@@ -1,4 +1,4 @@
-import { Deferred, Effect } from "effect";
+import { Deferred, Duration, Effect, Fiber } from "effect";
 import { AgentStreamEmitter } from "./AgentStreamEmitter.js";
 import { Display } from "./Display.js";
 import { preprocessPrompt } from "./PromptPreprocessor.js";
@@ -12,15 +12,8 @@ import type { SandboxService } from "./SandboxFactory.js";
 import { SandboxFactory, SANDBOX_REPO_DIR } from "./SandboxFactory.js";
 import { withSandboxLifecycle, type SandboxHooks } from "./SandboxLifecycle.js";
 import type { AgentProvider, IterationUsage } from "./AgentProvider.js";
+import type { Timeouts } from "./run.js";
 import { TextDeltaBuffer } from "./TextDeltaBuffer.js";
-import {
-  hostSessionStore,
-  sandboxSessionStore,
-  transferSession,
-} from "./SessionStore.js";
-import { SessionPaths } from "./SessionPaths.js";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
 
 export type { ParsedStreamEvent, IterationUsage } from "./AgentProvider.js";
 
@@ -32,50 +25,98 @@ const invokeAgent = (
   prompt: string,
   provider: AgentProvider,
   idleTimeoutMs: number,
+  completionTimeoutMs: number,
+  completionSignals: readonly string[],
   onText: (text: string) => void,
   onToolCall: (name: string, formattedArgs: string) => void,
-  onRawLine: (line: string) => void,
   onIdleWarning: (minutes: number) => void,
+  onCompletionTimeout: (timeoutMs: number) => void,
   idleWarningIntervalMs: number = IDLE_WARNING_INTERVAL_MS,
   resumeSession?: string,
+  forkSession?: boolean,
   signal?: AbortSignal,
-): Effect.Effect<{ result: string; sessionId?: string }, SandboxError> =>
+): Effect.Effect<
+  { result: string; sessionId?: string; usage?: IterationUsage },
+  SandboxError
+> =>
   Effect.gen(function* () {
     let resultText = "";
     let sessionId: string | undefined;
-    const agentAbortController = new AbortController();
+    let usage: IterationUsage | undefined;
+    // Accumulated text/result output, scanned for the completion signal so a
+    // hanging process can be force-completed once the signal is in the buffer
+    // (see ADR 0019).
+    let accumulatedOutput = "";
 
-    // Deferred that will be failed when the idle timer fires
+    // Deferred that fails when the idle timer fires (no signal seen).
     const timeoutSignal = yield* Deferred.make<never, AgentIdleTimeoutError>();
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    // Deferred that resolves successfully when the completion-grace timer
+    // fires (signal seen but process hasn't exited). Resolving lets the race
+    // hand control back to the orchestrator with the buffered output, which
+    // still contains the signal so the existing completionSignal check works.
+    const completionTimeoutDeferred = yield* Deferred.make<
+      { result: string; sessionId?: string; usage?: IterationUsage },
+      never
+    >();
+    let timeoutFiber: Fiber.RuntimeFiber<unknown, unknown> | null = null;
+    let completionDetected = false;
 
     // Periodic idle warning state
-    let warningHandle: ReturnType<typeof setInterval> | null = null;
+    let warningFiber: Fiber.RuntimeFiber<unknown, unknown> | null = null;
     let idleMinuteCounter = 0;
 
-    const startWarningInterval = () => {
-      if (warningHandle !== null) clearInterval(warningHandle);
-      idleMinuteCounter = 0;
-      warningHandle = setInterval(() => {
-        idleMinuteCounter++;
-        onIdleWarning(idleMinuteCounter);
-      }, idleWarningIntervalMs);
+    const interruptFiber = (
+      fiber: Fiber.RuntimeFiber<unknown, unknown> | null,
+    ) => {
+      if (fiber !== null) Effect.runFork(Fiber.interrupt(fiber));
     };
 
-    const resetIdleTimer = () => {
-      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
-      timeoutHandle = setTimeout(() => {
-        const idleError = new AgentIdleTimeoutError({
-          message: `Agent idle for ${idleTimeoutMs / 1000} seconds — no output received. Consider increasing the idle timeout with --idle-timeout.`,
-          timeoutMs: idleTimeoutMs,
-        });
-        Effect.runPromise(Deferred.fail(timeoutSignal, idleError)).catch(
-          () => {},
+    const startWarningInterval = () => {
+      interruptFiber(warningFiber);
+      idleMinuteCounter = 0;
+      warningFiber = Effect.runFork(
+        Effect.gen(function* () {
+          while (true) {
+            yield* Effect.sleep(Duration.millis(idleWarningIntervalMs));
+            idleMinuteCounter++;
+            onIdleWarning(idleMinuteCounter);
+          }
+        }),
+      );
+    };
+
+    const resetTimer = () => {
+      interruptFiber(timeoutFiber);
+      if (completionDetected) {
+        // Post-signal grace window — successful resolution on expiry.
+        timeoutFiber = Effect.runFork(
+          Effect.gen(function* () {
+            yield* Effect.sleep(Duration.millis(completionTimeoutMs));
+            onCompletionTimeout(completionTimeoutMs);
+            yield* Deferred.succeed(completionTimeoutDeferred, {
+              result: resultText || accumulatedOutput,
+              sessionId,
+              usage,
+            });
+          }),
         );
-        agentAbortController.abort(idleError);
-      }, idleTimeoutMs);
-      // Reset warning interval on activity
-      startWarningInterval();
+      } else {
+        // Pre-signal idle window — failure on expiry.
+        timeoutFiber = Effect.runFork(
+          Effect.gen(function* () {
+            yield* Effect.sleep(Duration.millis(idleTimeoutMs));
+            yield* Deferred.fail(
+              timeoutSignal,
+              new AgentIdleTimeoutError({
+                message: `Agent idle for ${idleTimeoutMs / 1000} seconds — no output received. Consider increasing the idle timeout with --idle-timeout.`,
+                timeoutMs: idleTimeoutMs,
+              }),
+            );
+          }),
+        );
+        // Reset warning interval on activity, idle-phase only.
+        startWarningInterval();
+      }
     };
 
     // Deferred that will be resolved (as a defect) when the AbortSignal fires.
@@ -87,42 +128,53 @@ const invokeAgent = (
         return yield* Effect.die(signal.reason);
       }
       const onAbort = () => {
-        agentAbortController.abort(signal.reason);
-        Effect.runPromise(Deferred.die(abortDeferred, signal.reason)).catch(
-          () => {},
-        );
+        Effect.runFork(Deferred.die(abortDeferred, signal.reason));
       };
       signal.addEventListener("abort", onAbort, { once: true });
       abortCleanup = () => signal.removeEventListener("abort", onAbort);
     }
 
-    resetIdleTimer();
+    resetTimer();
 
     const execEffect = Effect.gen(function* () {
       const printCmd = provider.buildPrintCommand({
         prompt,
         dangerouslySkipPermissions: true,
         resumeSession,
+        forkSession,
       });
       const execResult = yield* sandbox.exec(printCmd.command, {
         onLine: (line) => {
-          resetIdleTimer();
-          onRawLine(line);
           for (const parsed of provider.parseStreamLine(line)) {
             if (parsed.type === "text") {
               onText(parsed.text);
+              accumulatedOutput += parsed.text;
             } else if (parsed.type === "result") {
               resultText = parsed.result;
+              accumulatedOutput += parsed.result;
             } else if (parsed.type === "tool_call") {
               onToolCall(parsed.name, parsed.args);
             } else if (parsed.type === "session_id") {
               sessionId = parsed.sessionId;
+            } else if (parsed.type === "usage") {
+              usage = parsed.usage;
             }
           }
+          // Check for the completion signal AFTER parsing this line so the
+          // accumulator contains everything seen so far. Flip to the
+          // completion-grace timer the first time the signal appears.
+          if (
+            !completionDetected &&
+            completionSignals.some((sig) => accumulatedOutput.includes(sig))
+          ) {
+            completionDetected = true;
+            interruptFiber(warningFiber);
+            warningFiber = null;
+          }
+          resetTimer();
         },
         cwd: sandboxRepoDir,
         stdin: printCmd.stdin,
-        signal: agentAbortController.signal,
       });
 
       if (execResult.exitCode !== 0) {
@@ -143,23 +195,23 @@ const invokeAgent = (
         );
       }
 
-      return { result: resultText || execResult.stdout, sessionId };
+      return { result: resultText || execResult.stdout, sessionId, usage };
     }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
-          if (timeoutHandle !== null) {
-            clearTimeout(timeoutHandle);
-            timeoutHandle = null;
-          }
-          if (warningHandle !== null) {
-            clearInterval(warningHandle);
-            warningHandle = null;
-          }
+          interruptFiber(timeoutFiber);
+          timeoutFiber = null;
+          interruptFiber(warningFiber);
+          warningFiber = null;
         }),
       ),
     );
 
-    let raced = Effect.raceFirst(execEffect, Deferred.await(timeoutSignal));
+    let raced: Effect.Effect<
+      { result: string; sessionId?: string; usage?: IterationUsage },
+      AgentIdleTimeoutError | SandboxError
+    > = Effect.raceFirst(execEffect, Deferred.await(timeoutSignal));
+    raced = Effect.raceFirst(raced, Deferred.await(completionTimeoutDeferred));
     if (signal) {
       raced = Effect.raceFirst(
         raced,
@@ -171,6 +223,10 @@ const invokeAgent = (
       Effect.ensuring(
         Effect.sync(() => {
           abortCleanup?.();
+          interruptFiber(timeoutFiber);
+          timeoutFiber = null;
+          interruptFiber(warningFiber);
+          warningFiber = null;
         }),
       ),
     );
@@ -178,6 +234,7 @@ const invokeAgent = (
 
 const DEFAULT_COMPLETION_SIGNAL = "<promise>COMPLETE</promise>";
 const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 600 seconds
+const DEFAULT_COMPLETION_TIMEOUT_SECONDS = 60;
 
 export interface OrchestrateOptions {
   readonly hostRepoDir: string;
@@ -189,18 +246,34 @@ export interface OrchestrateOptions {
   readonly completionSignal?: string | string[];
   /** Idle timeout in seconds. If the agent produces no output for this long, it fails with AgentIdleTimeoutError. Default: 600 (10 minutes) */
   readonly idleTimeoutSeconds?: number;
+  /**
+   * Grace window in seconds after a completion signal is observed in the
+   * agent's output. The agent process is expected to exit shortly after
+   * emitting the signal; if it does not (because a spawned child is keeping
+   * stdout open — see ADR 0019), this timer fires and the iteration resolves
+   * successfully with the buffered output. Resets on every subsequent output
+   * line, so trailing data (token-usage events, terminal `result` events,
+   * structured-output tags) is still captured. Default: 60 seconds.
+   */
+  readonly completionTimeoutSeconds?: number;
   /** Optional name for the run, prepended to status messages as [name] */
   readonly name?: string;
   /** @internal Test-only override for the idle warning interval in milliseconds. Default: 60000 (1 minute). */
   readonly _idleWarningIntervalMs?: number;
-  /** Optional path for raw agent stdout stream JSONL diagnostics. */
-  readonly rawLogFilePath?: string;
   /** Resume a prior Claude Code session by ID. Applied to iteration 1 only. */
   readonly resumeSession?: string;
+  /**
+   * When true alongside `resumeSession`, fork the session instead of mutating
+   * it — the parent JSONL stays intact and the agent writes a new session
+   * under a fresh id. Applied to iteration 1 only. See ADR 0018.
+   */
+  readonly forkSession?: boolean;
   /** An AbortSignal that cancels the orchestration when aborted. */
   readonly signal?: AbortSignal;
   /** When true, skip prompt expansion (shell expression evaluation). Set for dynamic inline prompts. */
   readonly skipPromptExpansion?: boolean;
+  /** Override default timeouts for built-in lifecycle steps. Unset keys keep their defaults. */
+  readonly timeouts?: Timeouts;
 }
 
 /** Per-iteration result carrying an optional session ID. */
@@ -221,8 +294,6 @@ export interface OrchestrateResult {
   readonly stdout: string;
   readonly commits: { sha: string }[];
   readonly branch: string;
-  /** Host path to raw agent stdout stream diagnostics, when enabled. */
-  readonly rawLogFilePath?: string;
   /** Host path to the preserved worktree from the last iteration, set when the worktree was left behind due to uncommitted changes on a successful run. */
   readonly preservedWorktreePath?: string;
 }
@@ -232,15 +303,17 @@ export const orchestrate = (
 ): Effect.Effect<
   OrchestrateResult,
   SandboxError,
-  SandboxFactory | Display | SessionPaths | AgentStreamEmitter
+  SandboxFactory | Display | AgentStreamEmitter
 > => {
   const idleTimeoutMs =
     (options.idleTimeoutSeconds ?? DEFAULT_IDLE_TIMEOUT_SECONDS) * 1000;
+  const completionTimeoutMs =
+    (options.completionTimeoutSeconds ?? DEFAULT_COMPLETION_TIMEOUT_SECONDS) *
+    1000;
   return Effect.gen(function* () {
     const factory = yield* SandboxFactory;
     const display = yield* Display;
     const streamEmitter = yield* AgentStreamEmitter;
-    const { hostProjectsDir, sandboxProjectsDir } = yield* SessionPaths;
     const { hostRepoDir, iterations, hooks, prompt, branch, provider } =
       options;
     let completionSignals: string[];
@@ -261,27 +334,6 @@ export const orchestrate = (
     let resolvedBranch = "";
     let iterationPreservedPath: string | undefined;
 
-    const writeRawLog = (event: Record<string, unknown>): void => {
-      if (!options.rawLogFilePath) return;
-      try {
-        mkdirSync(dirname(options.rawLogFilePath), { recursive: true });
-        appendFileSync(
-          options.rawLogFilePath,
-          JSON.stringify({ timestamp: new Date().toISOString(), ...event }) +
-            "\n",
-        );
-      } catch {
-        // Raw logging is diagnostic only; it must never break the run.
-      }
-    };
-
-    writeRawLog({
-      type: "run_start",
-      name: options.name,
-      branch,
-      provider: provider.name,
-    });
-
     // Helper: check abort signal and bail via defect so run() can
     // re-throw the signal's reason verbatim (no Sandcastle wrapping).
     const checkAbort = (): Effect.Effect<void> =>
@@ -292,7 +344,10 @@ export const orchestrate = (
       yield* display.status(label(`Iteration ${i}/${iterations}`), "info");
 
       const sandboxResult = yield* factory.withSandbox(
-        ({ hostWorktreePath, sandboxRepoPath, applyToHost, bindMountHandle }) =>
+        (
+          { hostWorktreePath, sandboxRepoPath, applyToHost, bindMountHandle },
+          sandbox,
+        ) =>
           withSandboxLifecycle(
             {
               hostRepoDir,
@@ -302,23 +357,30 @@ export const orchestrate = (
               hostWorktreePath,
               applyToHost,
               signal: options.signal,
+              timeouts: options.timeouts,
             },
+            sandbox,
             (ctx) =>
               Effect.gen(function* () {
                 // Resume session: transfer JSONL from host to sandbox before iteration 1
                 const iterationResumeSession =
                   i === 1 ? options.resumeSession : undefined;
-                if (iterationResumeSession && bindMountHandle) {
+                const iterationForkSession =
+                  i === 1 ? options.forkSession : undefined;
+                if (
+                  iterationResumeSession &&
+                  bindMountHandle &&
+                  provider.sessionStorage
+                ) {
                   yield* display.status(label("Resuming session"), "info");
-                  const sbStore = sandboxSessionStore(
-                    ctx.sandboxRepoDir,
-                    bindMountHandle,
-                    sandboxProjectsDir,
-                  );
-                  const hStore = hostSessionStore(hostRepoDir, hostProjectsDir);
                   yield* Effect.tryPromise({
                     try: () =>
-                      transferSession(hStore, sbStore, iterationResumeSession),
+                      provider.sessionStorage!.resumeIntoSandbox({
+                        hostCwd: hostRepoDir,
+                        sandboxCwd: ctx.sandboxRepoDir,
+                        sessionId: iterationResumeSession,
+                        handle: bindMountHandle,
+                      }),
                     catch: (e) =>
                       new SessionCaptureError({
                         message: `Session resume failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -368,37 +430,42 @@ export const orchestrate = (
                     }),
                   );
                 };
-                const onRawLine = (line: string) => {
-                  writeRawLog({
-                    type: "stdout_line",
-                    iteration: i,
-                    line,
-                  });
-                };
                 const onIdleWarning = (minutes: number) => {
                   const msg =
                     minutes === 1
                       ? "Agent idle for 1 minute"
                       : `Agent idle for ${minutes} minutes`;
-                  writeRawLog({
-                    type: "idle_warning",
-                    iteration: i,
-                    idleMinutes: minutes,
-                  });
                   Effect.runPromise(display.status(label(msg), "warn"));
                 };
-                const { result: agentOutput, sessionId } = yield* invokeAgent(
+                const onCompletionTimeout = (timeoutMs: number) => {
+                  Effect.runPromise(
+                    display.status(
+                      label(
+                        `Completion signal seen but agent process is hanging — force-completing after ${timeoutMs / 1000}s grace window.`,
+                      ),
+                      "warn",
+                    ),
+                  );
+                };
+                const {
+                  result: agentOutput,
+                  sessionId,
+                  usage: streamUsage,
+                } = yield* invokeAgent(
                   ctx.sandbox,
                   ctx.sandboxRepoDir,
                   fullPrompt,
                   provider,
                   idleTimeoutMs,
+                  completionTimeoutMs,
+                  completionSignals,
                   onText,
                   onToolCall,
-                  onRawLine,
                   onIdleWarning,
+                  onCompletionTimeout,
                   options._idleWarningIntervalMs,
                   iterationResumeSession,
+                  iterationForkSession,
                   options.signal,
                 );
 
@@ -407,46 +474,47 @@ export const orchestrate = (
 
                 yield* display.status(label("Agent stopped"), "info");
 
-                // Capture session while sandbox is still alive
+                // Capture session while sandbox is still alive. Usage from the
+                // stream (e.g. Codex's turn.completed) is the baseline; a
+                // session-parsed value below overrides it when available.
                 let sessionFilePath: string | undefined;
-                let usage: IterationUsage | undefined;
-                if (provider.captureSessions && sessionId && bindMountHandle) {
+                let usage: IterationUsage | undefined = streamUsage;
+                if (
+                  provider.captureSessions &&
+                  provider.sessionStorage &&
+                  sessionId &&
+                  bindMountHandle
+                ) {
                   yield* display.status(label("Capturing session"), "info");
-                  const sbStore = sandboxSessionStore(
-                    ctx.sandboxRepoDir,
-                    bindMountHandle,
-                    sandboxProjectsDir,
-                  );
-                  const hStore = hostSessionStore(hostRepoDir, hostProjectsDir);
-                  const captureResult = yield* Effect.either(
-                    Effect.tryPromise({
-                      try: () => transferSession(sbStore, hStore, sessionId),
-                      catch: (e) =>
-                        new SessionCaptureError({
-                          message: `Session capture failed: ${e instanceof Error ? e.message : String(e)}`,
-                          sessionId,
-                        }),
-                    }),
+                  yield* Effect.tryPromise({
+                    try: () =>
+                      provider.sessionStorage!.captureToHost({
+                        hostCwd: hostRepoDir,
+                        sandboxCwd: ctx.sandboxRepoDir,
+                        sessionId,
+                        handle: bindMountHandle,
+                      }),
+                    catch: (e) =>
+                      new SessionCaptureError({
+                        message: `Session capture failed: ${e instanceof Error ? e.message : String(e)}`,
+                        sessionId,
+                      }),
+                  });
+                  sessionFilePath = provider.sessionStorage.hostSessionFilePath(
+                    hostRepoDir,
+                    sessionId,
                   );
 
-                  if (captureResult._tag === "Left") {
-                    yield* display.status(
-                      label(captureResult.left.message),
-                      "warn",
+                  // Parse token usage from the captured session JSONL
+                  if (provider.parseSessionUsage) {
+                    const content = yield* Effect.promise(() =>
+                      provider
+                        .sessionStorage!.readHostSession(hostRepoDir, sessionId)
+                        .catch(() => undefined as string | undefined),
                     );
-                  } else {
-                    sessionFilePath = hStore.sessionFilePath(sessionId);
-
-                    // Parse token usage from the captured session JSONL
-                    if (provider.parseSessionUsage) {
-                      const content = yield* Effect.promise(() =>
-                        hStore
-                          .readSession(sessionId)
-                          .catch(() => undefined as string | undefined),
-                      );
-                      if (content) {
-                        usage = provider.parseSessionUsage(content);
-                      }
+                    if (content) {
+                      const parsedUsage = provider.parseSessionUsage(content);
+                      if (parsedUsage) usage = parsedUsage;
                     }
                   }
                 }
@@ -505,7 +573,6 @@ export const orchestrate = (
       stdout: allStdout,
       commits: allCommits,
       branch: resolvedBranch,
-      rawLogFilePath: options.rawLogFilePath,
       preservedWorktreePath: iterationPreservedPath,
     };
   });

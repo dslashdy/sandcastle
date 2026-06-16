@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   writeFileSync,
   readFileSync,
 } from "node:fs";
@@ -34,7 +35,9 @@ describe("testIsolated()", () => {
     const handle = await provider.create({ env: {} });
     try {
       const result = await handle.exec("pwd");
-      expect(result.stdout.trim()).toBe(handle.worktreePath);
+      expect(result.stdout.trim()).toBe(
+        realpathSync.native(handle.worktreePath),
+      );
     } finally {
       await handle.close();
     }
@@ -45,7 +48,7 @@ describe("testIsolated()", () => {
     const handle = await provider.create({ env: {} });
     try {
       const result = await handle.exec("pwd", { cwd: "/tmp" });
-      expect(result.stdout.trim()).toBe("/tmp");
+      expect(result.stdout.trim()).toBe(realpathSync.native("/tmp"));
     } finally {
       await handle.close();
     }

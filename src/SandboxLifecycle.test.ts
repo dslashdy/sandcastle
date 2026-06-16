@@ -1,13 +1,19 @@
 import { Effect, Layer, Ref } from "effect";
 import { exec } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import { type DisplayEntry, SilentDisplay } from "./Display.js";
-import { Sandbox, type SandboxService } from "./SandboxFactory.js";
-import { makeLocalSandboxLayer } from "./testSandbox.js";
+import { type SandboxService } from "./SandboxFactory.js";
+import { makeLocalSandbox } from "./testSandbox.js";
 import { ExecError, SyncError } from "./errors.js";
 import { withSandboxLifecycle, runHostHooks } from "./SandboxLifecycle.js";
 
@@ -19,14 +25,11 @@ import { withSandboxLifecycle, runHostHooks } from "./SandboxLifecycle.js";
 const makePathTranslatingSandbox = (
   hostPath: string,
   containerPath: string,
-  _baseLayer: Layer.Layer<Sandbox>,
 ): SandboxService => {
   const translateCwd = (cwd?: string) =>
     cwd === containerPath ? hostPath : cwd;
 
-  const baseSandbox = Effect.runSync(
-    Effect.provide(Sandbox, makeLocalSandboxLayer(hostPath)),
-  );
+  const baseSandbox = makeLocalSandbox(hostPath);
 
   return {
     exec: (command, options) =>
@@ -71,8 +74,8 @@ const setup = async () => {
   const hostDir = await mkdtemp(join(tmpdir(), "host-"));
   const sandboxDir = await mkdtemp(join(tmpdir(), "sandbox-"));
   const sandboxRepoDir = join(sandboxDir, "repo");
-  const layer = makeLocalSandboxLayer(sandboxDir);
-  return { hostDir, sandboxDir, sandboxRepoDir, layer };
+  const sandbox = makeLocalSandbox(sandboxDir);
+  return { hostDir, sandboxDir, sandboxRepoDir, sandbox };
 };
 
 describe("withSandboxLifecycle (worktree mode)", () => {
@@ -94,12 +97,12 @@ describe("withSandboxLifecycle (worktree mode)", () => {
       { cwd: hostDir },
     );
 
-    const layer = makeLocalSandboxLayer(worktreeDir);
-    return { hostDir, worktreeDir, layer };
+    const sandbox = makeLocalSandbox(worktreeDir);
+    return { hostDir, worktreeDir, sandbox };
   };
 
   it("skips sync-in — worktree files are already accessible", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -107,6 +110,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             // Files from the host repo are already visible — no sync-in needed
@@ -115,12 +119,12 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             });
             expect(result.stdout.trim()).toBe("original");
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
   });
 
   it("commits in worktree are cherry-picked onto host's current branch", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -128,6 +132,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -141,7 +146,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Commit is cherry-picked onto host's current branch (main)
@@ -156,7 +161,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("onSandboxReady hooks still run in worktree mode", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -170,6 +175,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             const result = yield* ctx.sandbox.exec("cat ready-marker.txt", {
@@ -177,7 +183,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             });
             expect(result.stdout.trim()).toBe("ready");
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
   });
 
@@ -190,14 +196,14 @@ describe("withSandboxLifecycle (worktree mode)", () => {
     }> = [];
 
     // Custom sandbox layer that records exec calls
-    const spySandboxLayer = Layer.succeed(Sandbox, {
+    const sandbox: SandboxService = {
       exec: (command, options) => {
         execCalls.push({ command, options });
         return Effect.succeed({ stdout: "", stderr: "", exitCode: 0 });
       },
       copyIn: () => Effect.succeed(undefined as never),
       copyFileOut: () => Effect.succeed(undefined as never),
-    });
+    };
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -214,8 +220,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(spySandboxLayer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Find the hook exec calls (after git config calls)
@@ -241,7 +248,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
     // Track the order of start/end events to verify parallel execution
     const events: string[] = [];
 
-    const spySandboxLayer = Layer.succeed(Sandbox, {
+    const sandbox: SandboxService = {
       exec: (command, options) => {
         if (command === "slow-hook-a" || command === "slow-hook-b") {
           events.push(`start:${command}`);
@@ -256,7 +263,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
       },
       copyIn: () => Effect.succeed(undefined as never),
       copyFileOut: () => Effect.succeed(undefined as never),
-    });
+    };
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -273,8 +280,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(spySandboxLayer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // With parallel execution, both hooks should start before either ends
@@ -287,7 +295,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("returns commits made in the worktree", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -295,6 +303,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -308,7 +317,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     expect(result.commits).toHaveLength(1);
@@ -317,7 +326,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("returns empty commits when no work is done in worktree mode", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -325,8 +334,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         () => Effect.succeed("no-op"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     expect(result.commits).toHaveLength(0);
@@ -334,7 +344,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("temp branch is deleted after cherry-pick", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -342,6 +352,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -355,7 +366,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // The temp branch should no longer exist
@@ -366,7 +377,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("temp branch is deleted even when no commits were made", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -374,8 +385,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         () => Effect.succeed("no-op"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Temp branch deleted even with no commits
@@ -386,7 +398,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("preserves temp branch and throws on merge conflict", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await expect(
       Effect.runPromise(
@@ -395,6 +407,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             hostRepoDir: hostDir,
             sandboxRepoDir: worktreeDir,
           },
+          sandbox,
           (ctx) =>
             Effect.gen(function* () {
               // Commit a change to file.txt in the worktree
@@ -416,7 +429,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
                 );
               });
             }),
-        ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+        ).pipe(Effect.provide(testDisplayLayer)),
       ),
     ).rejects.toThrow(/merge.*failed/i);
 
@@ -428,7 +441,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("succeeds with merge commit when host branch has diverged (non-conflicting)", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -436,6 +449,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -457,7 +471,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               );
             });
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Both files should exist on main after the merge
@@ -477,19 +491,10 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("cherry-pick works when sandboxRepoDir differs from host worktree path", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir } = await setupWorktree();
 
-    // Simulate a bind-mount provider: sandboxRepoDir is the container mount point,
-    // which differs from the actual host worktree path. In production the sandbox
-    // sees /home/agent/workspace while the host sees .sandcastle/worktrees/<name>.
-    //
-    // We use a PathTranslating sandbox that maps the container path to the real
-    // worktree path — exactly what a bind-mount provider does.
     const containerPath = "/home/agent/workspace";
-    const translatingLayer = Layer.succeed(
-      Sandbox,
-      makePathTranslatingSandbox(worktreeDir, containerPath, layer),
-    );
+    const sandbox = makePathTranslatingSandbox(worktreeDir, containerPath);
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -499,6 +504,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
 
           hostWorktreePath: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -512,7 +518,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(translatingLayer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Commit should be cherry-picked onto host's current branch (main)
@@ -532,7 +538,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("cherry-pick succeeds when worktree commits include a merge commit", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -540,6 +546,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -560,7 +567,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // The feature commit should be cherry-picked onto main
@@ -580,7 +587,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
     // git rev-list --no-merges walks into the merged branches and collects all original
     // commits, then cherry-picking them sequentially onto main fails because they
     // touch overlapping files from the same base.
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -588,6 +595,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           hostRepoDir: hostDir,
           sandboxRepoDir: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -618,7 +626,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Both changes should be on the host's main branch
@@ -631,7 +639,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("sets host git user.name and user.email as global config in the sandbox", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     // setupWorktree sets user.email "test@test.com" and user.name "Test" locally in hostDir.
     // Verify these are propagated as --global config inside the sandbox.
@@ -643,6 +651,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           sandboxRepoDir: worktreeDir,
           branch: "sandcastle/test",
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             // Read the globally-set git config (--global) to confirm auto-propagation
@@ -657,7 +666,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               name: nameResult.stdout.trim(),
             };
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     expect(result.result.email).toBe("test@test.com");
@@ -665,7 +674,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("gracefully skips git identity propagation when host has no git config", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     // Unset local user config so git config user.name/email returns nothing
     await execAsync("git config --unset user.email", { cwd: hostDir }).catch(
@@ -683,14 +692,15 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             hostRepoDir: hostDir,
             sandboxRepoDir: worktreeDir,
           },
+          sandbox,
           () => Effect.succeed("ok"),
-        ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+        ).pipe(Effect.provide(testDisplayLayer)),
       ),
     ).resolves.toBeDefined();
   });
 
   it("no cherry-pick when explicit branch is given", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = await Effect.runPromise(
       withSandboxLifecycle(
@@ -700,6 +710,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           // explicit branch — commits stay on that branch, no cherry-pick
           branch: "sandcastle/test",
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -713,7 +724,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Branch stays as the explicit branch
@@ -734,7 +745,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("calls applyToHost after work completes but before merge operations", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const callOrder: string[] = [];
 
@@ -748,6 +759,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               callOrder.push("applyToHost");
             }) as Effect.Effect<void, SyncError>,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             callOrder.push("work");
@@ -762,7 +774,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               { cwd: ctx.sandboxRepoDir },
             );
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // applyToHost should be called after work but before the merge
@@ -772,14 +784,11 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("records baseHead from the host worktree, not from inside the sandbox", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir } = await setupWorktree();
 
     // Use a container path that differs from the host worktree path
     const containerPath = "/home/agent/workspace";
-    const translatingLayer = Layer.succeed(
-      Sandbox,
-      makePathTranslatingSandbox(worktreeDir, containerPath, layer),
-    );
+    const sandbox = makePathTranslatingSandbox(worktreeDir, containerPath);
 
     let capturedBaseHead = "";
     await Effect.runPromise(
@@ -789,11 +798,12 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           sandboxRepoDir: containerPath,
           hostWorktreePath: worktreeDir,
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             capturedBaseHead = ctx.baseHead;
           }),
-      ).pipe(Effect.provide(Layer.merge(translatingLayer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // baseHead should match the host worktree HEAD, not some sandbox-internal value
@@ -802,7 +812,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("applyToHost error propagates as SyncError", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await expect(
       Effect.runPromise(
@@ -813,14 +823,15 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             applyToHost: () =>
               Effect.fail(new SyncError({ message: "sync failed" })),
           },
+          sandbox,
           () => Effect.succeed("ok"),
-        ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+        ).pipe(Effect.provide(testDisplayLayer)),
       ),
     ).rejects.toThrow("sync failed");
   });
 
   it("logs 'No commits to sync out' when applyToHost is provided but no commits", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const displayRef = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
     const displayLayer = SilentDisplay.layer(displayRef);
 
@@ -833,10 +844,11 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             branch: "sandcastle/test",
             applyToHost: () => Effect.void,
           },
+          sandbox,
           () => Effect.succeed("ok"),
         );
         return yield* Ref.get(displayRef);
-      }).pipe(Effect.provide(Layer.merge(layer, displayLayer))),
+      }).pipe(Effect.provide(displayLayer)),
     );
 
     const syncLog = entries.find(
@@ -846,7 +858,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("logs 'Syncing N commits to host' when applyToHost is provided with commits", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const displayRef = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
     const displayLayer = SilentDisplay.layer(displayRef);
 
@@ -859,6 +871,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             branch: "sandcastle/test",
             applyToHost: () => Effect.void,
           },
+          sandbox,
           (ctx) =>
             Effect.gen(function* () {
               yield* ctx.sandbox.exec(
@@ -868,7 +881,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             }),
         );
         return yield* Ref.get(displayRef);
-      }).pipe(Effect.provide(Layer.merge(layer, displayLayer))),
+      }).pipe(Effect.provide(displayLayer)),
     );
 
     const syncLog = entries.find(
@@ -878,7 +891,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("does not log sync taskLog when applyToHost is not provided", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const displayRef = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
     const displayLayer = SilentDisplay.layer(displayRef);
 
@@ -890,23 +903,23 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             sandboxRepoDir: worktreeDir,
             branch: "sandcastle/test",
           },
+          sandbox,
           () => Effect.succeed("ok"),
         );
         return yield* Ref.get(displayRef);
-      }).pipe(Effect.provide(Layer.merge(layer, displayLayer))),
+      }).pipe(Effect.provide(displayLayer)),
     );
 
     const syncLog = entries.find(
       (e) =>
         e._tag === "taskLog" &&
-        (e.title === "No commits to sync out" ||
-          e.title.startsWith("Syncing")),
+        (e.title === "No commits to sync out" || e.title.startsWith("Syncing")),
     );
     expect(syncLog).toBeUndefined();
   });
 
   it("logs 'Merging to {branch}' taskLog in temp branch mode with commits", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const displayRef = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
     const displayLayer = SilentDisplay.layer(displayRef);
 
@@ -917,6 +930,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             hostRepoDir: hostDir,
             sandboxRepoDir: worktreeDir,
           },
+          sandbox,
           (ctx) =>
             Effect.gen(function* () {
               yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
@@ -932,7 +946,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             }),
         );
         return yield* Ref.get(displayRef);
-      }).pipe(Effect.provide(Layer.merge(layer, displayLayer))),
+      }).pipe(Effect.provide(displayLayer)),
     );
 
     const mergeLog = entries.find(
@@ -942,7 +956,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("logs 'Collecting commits' taskLog after agent work", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const displayRef = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
     const displayLayer = SilentDisplay.layer(displayRef);
 
@@ -954,10 +968,11 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             sandboxRepoDir: worktreeDir,
             branch: "sandcastle/test",
           },
+          sandbox,
           () => Effect.succeed("ok"),
         );
         return yield* Ref.get(displayRef);
-      }).pipe(Effect.provide(Layer.merge(layer, displayLayer))),
+      }).pipe(Effect.provide(displayLayer)),
     );
 
     const commitLog = entries.find(
@@ -967,7 +982,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("host.onSandboxReady hooks run on the host with worktree cwd", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -983,8 +998,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // The marker should exist on the host worktree (cwd = worktreeDir)
@@ -996,7 +1012,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("host.onSandboxReady and sandbox.onSandboxReady run in parallel", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await Effect.runPromise(
       withSandboxLifecycle(
@@ -1015,8 +1031,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     // Both markers should exist
@@ -1034,7 +1051,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("host.onSandboxReady hook is killed when signal fires", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const ac = new AbortController();
 
     const promise = Effect.runPromise(
@@ -1050,8 +1067,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     setTimeout(() => ac.abort("cancelled"), 50);
@@ -1059,7 +1077,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("sandbox.onSandboxReady hook is killed when signal fires", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
     const ac = new AbortController();
 
     const promise = Effect.runPromise(
@@ -1075,8 +1093,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     setTimeout(() => ac.abort("cancelled"), 50);
@@ -1084,7 +1103,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("hooks receive never-aborted signal when no signal is provided", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     // Should work normally — hooks complete without issues
     await Effect.runPromise(
@@ -1104,8 +1123,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     const content = await readFile(
@@ -1116,7 +1136,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   });
 
   it("host.onSandboxReady hook failure propagates error", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     await expect(
       Effect.runPromise(
@@ -1131,8 +1151,9 @@ describe("withSandboxLifecycle (worktree mode)", () => {
               },
             },
           },
+          sandbox,
           () => Effect.succeed("ok"),
-        ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+        ).pipe(Effect.provide(testDisplayLayer)),
       ),
     ).rejects.toThrow(/Host hook failed/);
   });
@@ -1140,7 +1161,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
   it("sandbox.onSandboxReady respects per-hook timeoutMs", async () => {
     const { hostDir, worktreeDir } = await setupWorktree();
 
-    const spySandboxLayer = Layer.succeed(Sandbox, {
+    const sandbox: SandboxService = {
       exec: (command, _options) => {
         if (command === "slow-install") {
           // Simulate a command that takes longer than the short timeout
@@ -1153,7 +1174,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
       },
       copyIn: () => Effect.succeed(undefined as never),
       copyFileOut: () => Effect.succeed(undefined as never),
-    });
+    };
 
     const result = Effect.runPromise(
       withSandboxLifecycle(
@@ -1163,21 +1184,20 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           branch: "sandcastle/test",
           hooks: {
             sandbox: {
-              onSandboxReady: [
-                { command: "slow-install", timeoutMs: 500 },
-              ],
+              onSandboxReady: [{ command: "slow-install", timeoutMs: 500 }],
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(spySandboxLayer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     await expect(result).rejects.toThrow(/timed out/);
   });
 
   it("host.onSandboxReady respects per-hook timeoutMs", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     const result = Effect.runPromise(
       withSandboxLifecycle(
@@ -1187,21 +1207,20 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           branch: "sandcastle/test",
           hooks: {
             host: {
-              onSandboxReady: [
-                { command: "sleep 2", timeoutMs: 500 },
-              ],
+              onSandboxReady: [{ command: "sleep 2", timeoutMs: 500 }],
             },
           },
         },
+        sandbox,
         () => Effect.succeed("ok"),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
 
     await expect(result).rejects.toThrow(/timed out/);
   });
 
   it("sandbox.onSandboxReady uses default timeout when timeoutMs omitted", async () => {
-    const { hostDir, worktreeDir, layer } = await setupWorktree();
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
 
     // A fast hook with no timeoutMs should succeed with the default 60s timeout
     await Effect.runPromise(
@@ -1216,6 +1235,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             },
           },
         },
+        sandbox,
         (ctx) =>
           Effect.gen(function* () {
             const result = yield* ctx.sandbox.exec("cat dt.txt", {
@@ -1223,8 +1243,208 @@ describe("withSandboxLifecycle (worktree mode)", () => {
             });
             expect(result.stdout.trim()).toBe("default-timeout");
           }),
-      ).pipe(Effect.provide(Layer.merge(layer, testDisplayLayer))),
+      ).pipe(Effect.provide(testDisplayLayer)),
     );
+  });
+
+  it("retries a transient exit-126 git setup failure, then succeeds", async () => {
+    const { hostDir, worktreeDir } = await setupWorktree();
+
+    let safeDirAttempts = 0;
+    // Sandbox where the first `safe.directory` config attempt exits 126
+    // (overlayfs/exec race seen under heavy parallelism), then succeeds.
+    // Effect.sync defers per-run so retries re-evaluate, matching how the
+    // real exec (Effect.tryPromise) re-invokes the SDK on each attempt.
+    const sandbox: SandboxService = {
+      exec: (command, _options) =>
+        Effect.sync(() => {
+          if (command.includes("safe.directory")) {
+            safeDirAttempts++;
+            if (safeDirAttempts === 1) {
+              return { stdout: "", stderr: "cannot exec", exitCode: 126 };
+            }
+          }
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }),
+      copyIn: () => Effect.succeed(undefined as never),
+      copyFileOut: () => Effect.succeed(undefined as never),
+    };
+
+    const result = await Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+        },
+        sandbox,
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    expect(safeDirAttempts).toBe(2);
+    expect(result.result).toBe("ok");
+  });
+
+  it("does not retry a non-transient git setup failure", async () => {
+    const { hostDir, worktreeDir } = await setupWorktree();
+
+    let safeDirAttempts = 0;
+    const sandbox: SandboxService = {
+      exec: (command, _options) =>
+        Effect.sync(() => {
+          if (command.includes("safe.directory")) {
+            safeDirAttempts++;
+            return { stdout: "", stderr: "fatal: bad config", exitCode: 1 };
+          }
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }),
+      copyIn: () => Effect.succeed(undefined as never),
+      copyFileOut: () => Effect.succeed(undefined as never),
+    };
+
+    await expect(
+      Effect.runPromise(
+        withSandboxLifecycle(
+          {
+            hostRepoDir: hostDir,
+            sandboxRepoDir: worktreeDir,
+            branch: "sandcastle/test",
+          },
+          sandbox,
+          () => Effect.succeed("ok"),
+        ).pipe(Effect.provide(testDisplayLayer)),
+      ),
+    ).rejects.toThrow(/exit 1/);
+
+    expect(safeDirAttempts).toBe(1);
+  });
+
+  it("respects a gitSetupMs timeout override", async () => {
+    const { hostDir, worktreeDir } = await setupWorktree();
+
+    // The git safe.directory setup command takes longer than the short
+    // gitSetupMs override, so it should time out rather than succeed under
+    // the default 10s timeout.
+    const sandbox: SandboxService = {
+      exec: (command, _options) => {
+        if (command.includes("safe.directory")) {
+          return Effect.gen(function* () {
+            yield* Effect.sleep("2 seconds");
+            return { stdout: "", stderr: "", exitCode: 0 };
+          });
+        }
+        return Effect.succeed({ stdout: "", stderr: "", exitCode: 0 });
+      },
+      copyIn: () => Effect.succeed(undefined as never),
+      copyFileOut: () => Effect.succeed(undefined as never),
+    };
+
+    const result = Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+          timeouts: { gitSetupMs: 300 },
+        },
+        sandbox,
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    await expect(result).rejects.toThrow(/Git command timed out after 300ms/);
+  });
+
+  it("respects a commitCollectionMs timeout override", async () => {
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
+
+    // A 1ms budget cannot outrun spawning the `git rev-list` process, so
+    // commit collection should time out under the override (default is 30s).
+    const result = Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+          timeouts: { commitCollectionMs: 1 },
+        },
+        sandbox,
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    await expect(result).rejects.toThrow(
+      /Commit collection timed out after 1ms/,
+    );
+  });
+
+  it("respects a mergeToHostMs timeout override", async () => {
+    const { hostDir, worktreeDir, sandbox } = await setupWorktree();
+
+    // Merge-to-head path (no explicit branch) with a real commit, so the
+    // host-side merge runs and times out under the 1ms override (default 30s).
+    const result = Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          timeouts: { mergeToHostMs: 1 },
+        },
+        sandbox,
+        (ctx) =>
+          Effect.gen(function* () {
+            yield* ctx.sandbox.exec('git config user.email "test@test.com"', {
+              cwd: ctx.sandboxRepoDir,
+            });
+            yield* ctx.sandbox.exec('git config user.name "Test"', {
+              cwd: ctx.sandboxRepoDir,
+            });
+            yield* ctx.sandbox.exec(
+              'sh -c "echo wt > wt.txt && git add wt.txt && git commit -m \\"wt commit\\""',
+              { cwd: ctx.sandboxRepoDir },
+            );
+          }),
+      ).pipe(Effect.provide(testDisplayLayer)),
+    );
+
+    await expect(result).rejects.toThrow(/timed out after 1ms/);
+  });
+
+  it("fails after exhausting retries on a persistent transient failure", async () => {
+    const { hostDir, worktreeDir } = await setupWorktree();
+
+    let safeDirAttempts = 0;
+    const sandbox: SandboxService = {
+      exec: (command, _options) =>
+        Effect.sync(() => {
+          if (command.includes("safe.directory")) {
+            safeDirAttempts++;
+            return { stdout: "", stderr: "cannot exec", exitCode: 126 };
+          }
+          return { stdout: "", stderr: "", exitCode: 0 };
+        }),
+      copyIn: () => Effect.succeed(undefined as never),
+      copyFileOut: () => Effect.succeed(undefined as never),
+    };
+
+    await expect(
+      Effect.runPromise(
+        withSandboxLifecycle(
+          {
+            hostRepoDir: hostDir,
+            sandboxRepoDir: worktreeDir,
+            branch: "sandcastle/test",
+          },
+          sandbox,
+          () => Effect.succeed("ok"),
+        ).pipe(Effect.provide(testDisplayLayer)),
+      ),
+    ).rejects.toThrow(/exit 126/);
+
+    // Initial attempt + bounded retries (does not loop forever)
+    expect(safeDirAttempts).toBeGreaterThan(1);
+    expect(safeDirAttempts).toBeLessThanOrEqual(4);
   });
 });
 
@@ -1269,7 +1489,7 @@ describe("runHostHooks", () => {
     await Effect.runPromise(runHostHooks([{ command: "pwd > cwd.txt" }], dir));
 
     const content = await readFile(join(dir, "cwd.txt"), "utf-8");
-    expect(content.trim()).toBe(dir);
+    expect(content.trim()).toBe(await realpath(dir));
   });
 
   it("aborts a running hook when signal fires", async () => {
@@ -1305,10 +1525,7 @@ describe("runHostHooks", () => {
     // sleep 2 with a 500ms timeout should fail
     await expect(
       Effect.runPromise(
-        runHostHooks(
-          [{ command: "sleep 2", timeoutMs: 500 }],
-          dir,
-        ),
+        runHostHooks([{ command: "sleep 2", timeoutMs: 500 }], dir),
       ),
     ).rejects.toThrow(/timed out/);
   });

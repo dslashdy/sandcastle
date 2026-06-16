@@ -24,6 +24,7 @@ import {
   type SandboxProvider,
 } from "../SandboxProvider.js";
 import { resolveHostPath } from "../mountUtils.js";
+import { registerShutdown } from "../shutdownRegistry.js";
 
 export interface SbxWorkspace {
   /**
@@ -120,7 +121,7 @@ export const sbx = (options?: SbxOptions): SandboxProvider => {
         ...workspaceArgs,
       ]);
 
-      const onExit = () => {
+      const removeSandboxSync = () => {
         try {
           execFileSync(sbxCommand, ["rm", "--force", sandboxName], {
             stdio: "ignore",
@@ -130,13 +131,7 @@ export const sbx = (options?: SbxOptions): SandboxProvider => {
           /* best-effort */
         }
       };
-      const onSignal = () => {
-        onExit();
-        process.exit(1);
-      };
-      process.on("exit", onExit);
-      process.on("SIGINT", onSignal);
-      process.on("SIGTERM", onSignal);
+      const unregisterShutdown = registerShutdown(removeSandboxSync);
 
       const envArgs = Object.entries(createOptions.env).flatMap(
         ([key, value]) => ["-e", `${key}=${value}`],
@@ -275,9 +270,7 @@ export const sbx = (options?: SbxOptions): SandboxProvider => {
           ]),
 
         close: async (): Promise<void> => {
-          process.removeListener("exit", onExit);
-          process.removeListener("SIGINT", onSignal);
-          process.removeListener("SIGTERM", onSignal);
+          unregisterShutdown();
           await execSbx(sbxCommand, ["rm", "--force", sandboxName]);
         },
       };

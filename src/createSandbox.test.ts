@@ -1,20 +1,20 @@
 import { exec } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { Effect, Layer } from "effect";
 import { describe, expect, it } from "vitest";
-import { claudeCode, pi } from "./AgentProvider.js";
+import { claudeCode, codex, pi } from "./AgentProvider.js";
 import { createSandbox, type CreateSandboxOptions } from "./createSandbox.js";
-import { Sandbox } from "./SandboxFactory.js";
+import type { SandboxService } from "./SandboxFactory.js";
 import {
   createBindMountSandboxProvider,
   createIsolatedSandboxProvider,
 } from "./SandboxProvider.js";
 import { testIsolated } from "./sandboxes/test-isolated.js";
-import { makeLocalSandboxLayer } from "./testSandbox.js";
+import { makeLocalSandbox } from "./testSandbox.js";
 
 /** Dummy sandbox provider used to satisfy the required `sandbox` field in test mode. */
 const testSandbox = createBindMountSandboxProvider({
@@ -93,19 +93,80 @@ const AGENT_PREFIXES: { prefix: string; toStream: (o: string) => string }[] = [
 ];
 
 /**
+ * Format a mock codex agent result as JSON stream lines, optionally including
+ * a `turn.completed` usage event so the Orchestrator can surface usage data
+ * via `streamUsage` (no session capture required).
+ */
+const toCodexStreamJsonWithUsage = (
+  output: string,
+  usage: {
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+  },
+): string => {
+  const lines: string[] = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: output },
+    }),
+    JSON.stringify({ type: "turn.completed", usage }),
+  ];
+  return lines.join("\n");
+};
+
+/** Mock sandbox that intercepts `codex` commands and emits stream usage. */
+const makeMockCodexLayerWithUsage = (
+  sandboxDir: string,
+  output: string,
+  usage: {
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+  },
+): SandboxService => {
+  const real = makeLocalSandbox(sandboxDir);
+  return {
+    exec: (command, options) => {
+      if (command.startsWith("codex ")) {
+        const streamOutput = toCodexStreamJsonWithUsage(output, usage);
+        if (options?.onLine) {
+          const onLine = options.onLine;
+          return Effect.gen(function* () {
+            for (const line of streamOutput.split("\n")) {
+              onLine(line);
+            }
+            return { stdout: streamOutput, stderr: "", exitCode: 0 };
+          });
+        }
+        return Effect.succeed({
+          stdout: streamOutput,
+          stderr: "",
+          exitCode: 0,
+        });
+      }
+      return real.exec(command, options);
+    },
+    copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+    copyFileOut: (sandboxPath, hostPath) =>
+      real.copyFileOut(sandboxPath, hostPath),
+  };
+};
+
+/**
  * Create a mock sandbox layer that intercepts agent commands and runs a
  * mock script instead. All other commands pass through to the local sandbox.
  */
 const makeMockAgentLayer = (
   sandboxDir: string,
   mockAgentBehavior: (sandboxRepoDir: string) => Promise<string>,
-): Layer.Layer<Sandbox> => {
-  const fsLayer = makeLocalSandboxLayer(sandboxDir);
+): SandboxService => {
+  const real = makeLocalSandbox(sandboxDir);
 
   const matchAgent = (command: string) =>
     AGENT_PREFIXES.find((a) => command.startsWith(a.prefix));
 
-  return Layer.succeed(Sandbox, {
+  return {
     exec: (command, options) => {
       const agent = matchAgent(command);
       if (agent && options?.onLine) {
@@ -127,19 +188,12 @@ const makeMockAgentLayer = (
           return { stdout: output, stderr: "", exitCode: 0 };
         });
       }
-      return Effect.flatMap(Sandbox, (real) =>
-        real.exec(command, options),
-      ).pipe(Effect.provide(fsLayer));
+      return real.exec(command, options);
     },
-    copyIn: (hostPath, sandboxPath) =>
-      Effect.flatMap(Sandbox, (real) =>
-        real.copyIn(hostPath, sandboxPath),
-      ).pipe(Effect.provide(fsLayer)),
+    copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
     copyFileOut: (sandboxPath, hostPath) =>
-      Effect.flatMap(Sandbox, (real) =>
-        real.copyFileOut(sandboxPath, hostPath),
-      ).pipe(Effect.provide(fsLayer)),
-  });
+      real.copyFileOut(sandboxPath, hostPath),
+  };
 };
 
 /**
@@ -193,7 +247,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -217,7 +271,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "agent output"),
       },
     });
@@ -238,6 +292,45 @@ describe("createSandbox", () => {
     }
   });
 
+  it("sandbox.run() emits 'Context window: NNNk' line when an iteration has usage", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+    const logPath = join(hostDir, "ctxwin.log");
+
+    const sandbox = await createSandbox({
+      branch: "ctxwin-branch",
+      sandbox: testSandbox,
+      cwd: hostDir,
+      _test: {
+        buildSandbox: (sandboxDir) =>
+          makeMockCodexLayerWithUsage(sandboxDir, "ok", {
+            input_tokens: 50000,
+            cached_input_tokens: 0,
+            output_tokens: 100,
+          }),
+      },
+    });
+
+    try {
+      const result = await sandbox.run({
+        agent: codex("gpt-test"),
+        prompt: "do something",
+        maxIterations: 1,
+        logging: { type: "file", path: logPath },
+      });
+
+      // Sanity-check: orchestrator surfaced usage on the iteration.
+      expect(result.iterations[0]!.usage).toBeDefined();
+
+      const log = await readFile(logPath, "utf-8");
+      expect(log).toContain("Context window: 50k");
+    } finally {
+      await sandbox.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
   it("sandbox.close() removes worktree when clean, returns no preservedWorktreePath", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
     await initRepo(hostDir);
@@ -248,7 +341,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -270,7 +363,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -300,7 +393,7 @@ describe("createSandbox", () => {
         sandbox: testSandbox,
         cwd: hostDir,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
       worktreePath = sandbox.worktreePath;
@@ -321,7 +414,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -331,7 +424,7 @@ describe("createSandbox", () => {
         sandbox: testSandbox,
         cwd: hostDir,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
 
@@ -354,7 +447,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -367,7 +460,7 @@ describe("createSandbox", () => {
         sandbox: testSandbox,
         cwd: hostDir,
         _test: {
-          buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+          buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
         },
       });
 
@@ -393,7 +486,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async (cwd) => {
             await writeFile(join(cwd, "agent-created.txt"), "new file");
             await execAsync("git add agent-created.txt", { cwd });
@@ -427,7 +520,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -449,7 +542,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "mock output"),
       },
     });
@@ -488,7 +581,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async (cwd) => {
             runCount++;
             const fname = `file-${runCount}.txt`;
@@ -549,7 +642,7 @@ describe("createSandbox", () => {
       },
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -720,7 +813,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async (cwd) => {
             runNumber++;
             if (runNumber === 1) {
@@ -1164,7 +1257,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "agent output"),
       },
     });
@@ -1193,7 +1286,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "agent output"),
       },
     });
@@ -1226,7 +1319,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "agent output"),
       },
     });
@@ -1266,7 +1359,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) =>
+        buildSandbox: (sandboxDir) =>
           makeMockAgentLayer(sandboxDir, async () => "agent output"),
       },
     });
@@ -1411,7 +1504,7 @@ describe("createSandbox", () => {
       sandbox: testSandbox,
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 
@@ -1422,6 +1515,41 @@ describe("createSandbox", () => {
       expect(worktreeHead.trim()).toBe(baseSha.trim());
     } finally {
       await sandbox.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the worktree when sandbox start fails (no orphan)", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandbox-test-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+
+    const failingProvider = createBindMountSandboxProvider({
+      name: "failing-create",
+      create: async () => {
+        throw new Error("Image 'sandcastle:test' not found locally");
+      },
+    });
+
+    try {
+      await expect(
+        createSandbox({
+          branch: "test-start-fails",
+          sandbox: failingProvider,
+          cwd: hostDir,
+        }),
+      ).rejects.toThrow();
+
+      // The worktree must not be left orphaned on disk.
+      const worktreesDir = join(hostDir, ".sandcastle", "worktrees");
+      const leftover = existsSync(worktreesDir)
+        ? readdirSync(worktreesDir)
+        : [];
+      expect(leftover).toHaveLength(0);
+
+      const { stdout } = await execAsync("git worktree list", { cwd: hostDir });
+      expect(stdout).not.toContain(".sandcastle/worktrees");
+    } finally {
       await rm(hostDir, { recursive: true, force: true });
     }
   });
@@ -1440,7 +1568,7 @@ describe("createSandbox", () => {
       copyToWorktree: ["config.json"],
       cwd: hostDir,
       _test: {
-        buildSandboxLayer: (sandboxDir) => makeLocalSandboxLayer(sandboxDir),
+        buildSandbox: (sandboxDir) => makeLocalSandbox(sandboxDir),
       },
     });
 

@@ -4,6 +4,9 @@ import { Data, Duration, Effect } from "effect";
 export class ExecError extends Data.TaggedError("ExecError")<{
   readonly message: string;
   readonly command: string;
+  /** Exit code of the failed command, when the command ran but returned non-zero.
+   *  Absent when the failure was the exec itself (e.g. the SDK threw before a code was available). */
+  readonly exitCode?: number;
 }> {}
 
 /** Command execution failed on the host */
@@ -40,6 +43,10 @@ export class WorktreeError extends Data.TaggedError("WorktreeError")<{
 /** Prompt resolution or preprocessing failed */
 export class PromptError extends Data.TaggedError("PromptError")<{
   readonly message: string;
+  /** Exit code of the failing shell expression, set when the failure is a non-zero
+   *  exit from a `` !`command` `` expansion. Absent for other prompt-resolution failures
+   *  (missing template arg, file not readable, etc.). Mirrors the optional `exitCode` on `ExecError`. */
+  readonly exitCode?: number;
 }> {}
 
 /** Agent invocation failed */
@@ -135,6 +142,10 @@ export class PromptExpansionTimeoutError extends Data.TaggedError(
   readonly message: string;
   readonly timeoutMs: number;
   readonly expression: string;
+  /** Wall-clock time the shell expression actually ran before timing out, measured at the throw site.
+   *  Distinct from `timeoutMs` (the configured deadline) so a downstream orchestrator can tell a
+   *  genuine contention timeout from a near-instant abort. */
+  readonly elapsedMs: number;
 }> {}
 
 /** Commit collection timed out */

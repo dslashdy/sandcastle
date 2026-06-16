@@ -32,16 +32,15 @@ export type {
 export type { PromptArgs } from "./PromptArgumentSubstitution.js";
 export type { AgentStreamEvent } from "./AgentStreamEmitter.js";
 export {
-  hostSessionStore,
-  sandboxSessionStore,
-  transferSession,
+  transferClaudeSession,
+  transferCodexSession,
+  encodeProjectPath,
+  claudeHostSessionPath,
+  claudeSandboxSessionPath,
+  findClaudeSessionOnHost,
+  findCodexSessionOnHost,
 } from "./SessionStore.js";
-export type { SessionStore } from "./SessionStore.js";
-export {
-  SessionPaths,
-  sessionPathsLayer,
-  defaultSessionPathsLayer,
-} from "./SessionPaths.js";
+export type { HostSessionLookup } from "./SessionStore.js";
 export type { SandboxHooks } from "./SandboxLifecycle.js";
 export type { MountConfig } from "./MountConfig.js";
 export { Output, StructuredOutputError } from "./Output.js";
@@ -50,14 +49,23 @@ export type {
   OutputObjectDefinition,
   OutputStringDefinition,
 } from "./Output.js";
-export { CwdError } from "./resolveCwd.js";
-export { claudeCode, codex, opencode, pi } from "./AgentProvider.js";
+export { CwdError } from "./CwdError.js";
+export {
+  claudeCode,
+  codex,
+  copilot,
+  cursor,
+  opencode,
+  pi,
+} from "./AgentProvider.js";
 export type {
   AgentProvider,
   AgentCommandOptions,
   PrintCommand,
   ClaudeCodeOptions,
   CodexOptions,
+  CopilotOptions,
+  CursorOptions,
   OpenCodeOptions,
   PiOptions,
 } from "./AgentProvider.js";

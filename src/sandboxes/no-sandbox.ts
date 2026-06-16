@@ -5,8 +5,9 @@
  *   import { noSandbox } from "sandcastle/sandboxes/no-sandbox";
  *   await interactive({ agent: claudeCode("claude-opus-4-7"), sandbox: noSandbox() });
  *
- * Only valid for `interactive()` — not accepted by `run()` or `createSandbox()`.
- * Does not pass `--dangerously-skip-permissions` to the agent — the user manages
+ * Accepted by `run()`, `interactive()`, and `createSandbox()`. Skips
+ * container isolation entirely — the agent executes on the host. Does not
+ * pass `--dangerously-skip-permissions` to the agent — the user manages
  * permissions themselves.
  */
 
@@ -18,10 +19,20 @@ import type {
   ExecResult,
   InteractiveExecOptions,
 } from "../SandboxProvider.js";
+import { BoundedTail, MAX_TAIL_CHARS } from "../boundedTail.js";
 
 export interface NoSandboxOptions {
   /** Environment variables injected by this provider. Merged at launch time. */
   readonly env?: Record<string, string>;
+  /**
+   * Maximum number of characters of streamed `exec` output retained per stream
+   * (stdout and stderr) when an `onLine` callback is supplied (default: 64KiB).
+   *
+   * Output is delivered live to `onLine` regardless; this only bounds the tail
+   * returned in `ExecResult`, preventing a long-running agent's output from
+   * overflowing V8's max string length and crashing the run.
+   */
+  readonly maxOutputTailChars?: number;
 }
 
 /**
@@ -38,6 +49,7 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
   create: async (createOptions): Promise<NoSandboxHandle> => {
     const worktreePath = createOptions.worktreePath;
     const processEnv = { ...process.env, ...createOptions.env };
+    const maxOutputTailChars = options?.maxOutputTailChars ?? MAX_TAIL_CHARS;
 
     const handle: NoSandboxHandle = {
       worktreePath,
@@ -49,18 +61,12 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
           cwd?: string;
           sudo?: boolean;
           stdin?: string;
-          signal?: AbortSignal;
         },
       ): Promise<ExecResult> => {
         // sudo is a no-op for no-sandbox — the user is already on the host
         const cwd = opts?.cwd ?? worktreePath;
 
         return new Promise((resolve, reject) => {
-          if (opts?.signal?.aborted) {
-            reject(opts.signal.reason ?? new Error("exec aborted"));
-            return;
-          }
-
           const proc = spawn("sh", ["-c", command], {
             cwd,
             env: processEnv,
@@ -71,56 +77,51 @@ export const noSandbox = (options?: NoSandboxOptions): NoSandboxProvider => ({
             ],
           });
 
-          let killTimer: ReturnType<typeof setTimeout> | undefined;
-          const abort = () => {
-            proc.kill("SIGTERM");
-            killTimer = setTimeout(() => {
-              if (proc.exitCode === null && proc.signalCode === null) {
-                proc.kill("SIGKILL");
-              }
-            }, 2000);
-          };
-          opts?.signal?.addEventListener("abort", abort, { once: true });
-
           if (opts?.stdin !== undefined) {
             proc.stdin!.write(opts.stdin);
             proc.stdin!.end();
           }
 
-          const stdoutChunks: string[] = [];
-          const stderrChunks: string[] = [];
-
-          if (opts?.onLine) {
-            const rl = createInterface({ input: proc.stdout! });
-            rl.on("line", (line) => {
-              stdoutChunks.push(line);
-              opts.onLine!(line);
-            });
-          } else {
-            proc.stdout!.on("data", (chunk: Buffer) => {
-              stdoutChunks.push(chunk.toString());
-            });
-          }
-
-          proc.stderr!.on("data", (chunk: Buffer) => {
-            stderrChunks.push(chunk.toString());
-          });
-
           proc.on("error", (error) => {
-            opts?.signal?.removeEventListener("abort", abort);
-            if (killTimer) clearTimeout(killTimer);
             reject(new Error(`exec failed: ${error.message}`));
           });
 
-          proc.on("close", (code) => {
-            opts?.signal?.removeEventListener("abort", abort);
-            if (killTimer) clearTimeout(killTimer);
-            resolve({
-              stdout: stdoutChunks.join(opts?.onLine ? "\n" : ""),
-              stderr: stderrChunks.join(""),
-              exitCode: code ?? 0,
+          if (opts?.onLine) {
+            const onLine = opts.onLine;
+            const stdoutTail = new BoundedTail(maxOutputTailChars, "\n");
+            const stderrTail = new BoundedTail(maxOutputTailChars, "");
+            const rl = createInterface({ input: proc.stdout! });
+            rl.on("line", (line) => {
+              stdoutTail.push(line);
+              onLine(line);
             });
-          });
+            proc.stderr!.on("data", (chunk: Buffer) => {
+              stderrTail.push(chunk.toString());
+            });
+            proc.on("close", (code) => {
+              resolve({
+                stdout: stdoutTail.toString(),
+                stderr: stderrTail.toString(),
+                exitCode: code ?? 0,
+              });
+            });
+          } else {
+            const stdoutChunks: string[] = [];
+            const stderrChunks: string[] = [];
+            proc.stdout!.on("data", (chunk: Buffer) => {
+              stdoutChunks.push(chunk.toString());
+            });
+            proc.stderr!.on("data", (chunk: Buffer) => {
+              stderrChunks.push(chunk.toString());
+            });
+            proc.on("close", (code) => {
+              resolve({
+                stdout: stdoutChunks.join(""),
+                stderr: stderrChunks.join(""),
+                exitCode: code ?? 0,
+              });
+            });
+          }
         });
       },
 

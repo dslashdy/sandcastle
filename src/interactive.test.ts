@@ -1,5 +1,11 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  realpathSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
@@ -59,18 +65,20 @@ describe("buildInteractiveArgs with prompts", () => {
     expect(args).not.toContain("");
   });
 
-  it("opencode passes prompt via -p flag", () => {
+  it("opencode passes prompt via --prompt flag", () => {
     const provider = opencode("opencode/big-pickle");
     const args = provider.buildInteractiveArgs!(interactiveOpts("fix the bug"));
     expect(args[0]).toBe("opencode");
-    const pIdx = args.indexOf("-p");
+    const pIdx = args.indexOf("--prompt");
     expect(pIdx).toBeGreaterThan(-1);
     expect(args[pIdx + 1]).toBe("fix the bug");
+    expect(args).not.toContain("-p");
   });
 
-  it("opencode omits -p flag when prompt is empty", () => {
+  it("opencode omits --prompt flag when prompt is empty", () => {
     const provider = opencode("opencode/big-pickle");
     const args = provider.buildInteractiveArgs!(interactiveOpts(""));
+    expect(args).not.toContain("--prompt");
     expect(args).not.toContain("-p");
   });
 });
@@ -589,6 +597,29 @@ describe("interactive()", () => {
     expect(executionOrder).toEqual(["interactive-after-hook"]);
   });
 
+  it("removes the worktree when sandbox start fails (no orphan)", async () => {
+    const provider = createBindMountSandboxProvider({
+      name: "failing-create",
+      create: async () => {
+        throw new Error("Image 'sandcastle:test' not found locally");
+      },
+    });
+
+    await expect(
+      interactive({
+        agent: claudeCode("claude-opus-4-7"),
+        sandbox: provider,
+        prompt: "test",
+        branchStrategy: { type: "merge-to-head" },
+      }),
+    ).rejects.toThrow();
+
+    // The worktree must not be left orphaned on disk.
+    const worktreesDir = join(hostDir, ".sandcastle", "worktrees");
+    const leftover = existsSync(worktreesDir) ? readdirSync(worktreesDir) : [];
+    expect(leftover).toHaveLength(0);
+  });
+
   // --- copyToWorktree tests ---
 
   it("throws when copyToWorktree used with head strategy", async () => {
@@ -747,7 +778,11 @@ describe("interactive()", () => {
     expect(result.exitCode).toBe(0);
     // The worktree should be under process.cwd() (which is hostDir)
     expect(worktreeCwd).toBeDefined();
-    expect(worktreeCwd!.startsWith(hostDir)).toBe(true);
+    expect(
+      realpathSync
+        .native(worktreeCwd!)
+        .startsWith(realpathSync.native(hostDir)),
+    ).toBe(true);
   });
 
   it("copies files to worktree with copyToWorktree", async () => {

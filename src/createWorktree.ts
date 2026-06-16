@@ -1,15 +1,13 @@
 import { NodeContext, NodeFileSystem } from "@effect/platform-node";
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Effect, Layer } from "effect";
-import { hostSessionStore } from "./SessionStore.js";
 import type { AgentProvider } from "./AgentProvider.js";
 import { ClackDisplay, Display, FileDisplay } from "./Display.js";
 import { preprocessPrompt } from "./PromptPreprocessor.js";
 import { resolvePrompt } from "./PromptResolver.js";
 import {
   SandboxFactory,
-  makeSandboxLayerFromHandle,
+  makeSandboxFromHandle,
   resolveGitMounts,
   SANDBOX_REPO_DIR,
 } from "./SandboxFactory.js";
@@ -31,17 +29,14 @@ import type { CloseResult, Sandbox } from "./createSandbox.js";
 import { createSandboxFromWorktree } from "./createSandbox.js";
 import type { InteractiveResult } from "./interactive.js";
 import {
+  buildCompletionMessage,
+  buildContextWindowLines,
   buildLogFilename,
-  buildRawLogFilePath,
   printFileDisplayStartup,
 } from "./run.js";
 import type { LoggingOption } from "./run.js";
 import { orchestrate, type IterationResult } from "./Orchestrator.js";
-import { defaultSessionPathsLayer } from "./SessionPaths.js";
-import {
-  callbackAgentStreamEmitterLayer,
-  noopAgentStreamEmitterLayer,
-} from "./AgentStreamEmitter.js";
+import { agentStreamEmitterLayer } from "./AgentStreamEmitter.js";
 import { resolveEnv } from "./EnvResolver.js";
 import { mergeProviderEnv } from "./mergeProviderEnv.js";
 import { startSandbox } from "./startSandbox.js";
@@ -49,6 +44,7 @@ import { syncOut } from "./syncOut.js";
 import * as WorktreeManager from "./WorktreeManager.js";
 import { copyToWorktree } from "./CopyToWorktree.js";
 import { resolveCwd } from "./resolveCwd.js";
+import { assertResumeSessionExists } from "./resumePrecheck.js";
 import {
   type PromptArgs,
   substitutePromptArgs,
@@ -134,6 +130,8 @@ export interface WorktreeRunOptions {
   readonly completionSignal?: string | string[];
   /** Idle timeout in seconds. Default: 600. */
   readonly idleTimeoutSeconds?: number;
+  /** Grace window in seconds after a completion signal is observed but the agent process has not exited. See ADR 0019. Default: 60. */
+  readonly completionTimeoutSeconds?: number;
   /** Optional name for the run. */
   readonly name?: string;
   /** Logging mode. */
@@ -169,8 +167,6 @@ export interface WorktreeRunResult {
   readonly branch: string;
   /** Path to the log file, if logging was drained to a file. */
   readonly logFilePath?: string;
-  /** Path to raw agent stdout stream diagnostics, if logging was drained to a file. */
-  readonly rawLogFilePath?: string;
 }
 
 export interface WorktreeCreateSandboxOptions {
@@ -184,9 +180,9 @@ export interface WorktreeCreateSandboxOptions {
   readonly timeouts?: Timeouts;
   /** @internal Test-only overrides to bypass the sandbox provider. */
   readonly _test?: {
-    readonly buildSandboxLayer?: (
+    readonly buildSandbox?: (
       sandboxDir: string,
-    ) => import("effect").Layer.Layer<import("./SandboxFactory.js").Sandbox>;
+    ) => import("./SandboxFactory.js").SandboxService;
   };
 }
 
@@ -386,7 +382,7 @@ export const createWorktree = async (
           );
         }
         const interactiveExecFn = handle.interactiveExec.bind(handle);
-        const sandboxLayer = makeSandboxLayerFromHandle(handle);
+        const sandbox = makeSandboxFromHandle(handle);
         const worktreePath = handle.worktreePath;
 
         const applyToHost =
@@ -402,7 +398,9 @@ export const createWorktree = async (
             branch: worktreeInfo.branch,
             hostWorktreePath: worktreeInfo.path,
             applyToHost,
+            timeouts: options.timeouts,
           },
+          sandbox,
           (ctx) =>
             Effect.gen(function* () {
               const fullPrompt =
@@ -435,9 +433,7 @@ export const createWorktree = async (
             }),
         );
 
-        const lifecycleResult = yield* lifecycleEffect.pipe(
-          Effect.provide(sandboxLayer),
-        );
+        const lifecycleResult = yield* lifecycleEffect;
 
         const exitCode = lifecycleResult.result;
 
@@ -493,13 +489,12 @@ export const createWorktree = async (
     }
 
     if (opts.resumeSession) {
-      const hStore = hostSessionStore(hostRepoDir);
-      const sessionPath = hStore.sessionFilePath(opts.resumeSession);
-      if (!existsSync(sessionPath)) {
-        throw new Error(
-          `resumeSession "${opts.resumeSession}" not found: expected session file at ${sessionPath}`,
-        );
-      }
+      await assertResumeSessionExists({
+        provider,
+        sandboxTag: sandboxProvider.tag,
+        hostRepoDir,
+        resumeSession: opts.resumeSession,
+      });
     }
 
     const inner = Effect.gen(function* () {
@@ -539,7 +534,10 @@ export const createWorktree = async (
       }
 
       // 4. Start sandbox
-      let handle: BindMountSandboxHandle | IsolatedSandboxHandle;
+      let handle:
+        | BindMountSandboxHandle
+        | IsolatedSandboxHandle
+        | NoSandboxHandle;
       let sandboxRepoDir: string;
 
       if (sandboxProvider.tag === "isolated") {
@@ -547,6 +545,15 @@ export const createWorktree = async (
           provider: sandboxProvider,
           hostRepoDir: worktreeInfo.path,
           env: effectiveEnv,
+        });
+        handle = startResult.handle;
+        sandboxRepoDir = startResult.worktreePath;
+      } else if (sandboxProvider.tag === "none") {
+        const startResult = yield* startSandbox({
+          provider: sandboxProvider,
+          hostRepoDir,
+          env: effectiveEnv,
+          worktreeOrRepoPath: worktreeInfo.path,
         });
         handle = startResult.handle;
         sandboxRepoDir = startResult.worktreePath;
@@ -565,7 +572,7 @@ export const createWorktree = async (
         sandboxRepoDir = startResult.worktreePath;
       }
 
-      const sandboxLayer = makeSandboxLayerFromHandle(handle);
+      const sandbox = makeSandboxFromHandle(handle);
       const applyToHost =
         sandboxProvider.tag === "isolated"
           ? () => syncOut(worktreeInfo.path, handle as IsolatedSandboxHandle)
@@ -581,17 +588,12 @@ export const createWorktree = async (
           buildLogFilename(worktreeInfo.branch, undefined, opts.name),
         ),
       };
-      const rawLogFilePath =
-        resolvedLogging.type === "file"
-          ? buildRawLogFilePath(resolvedLogging.path)
-          : undefined;
 
       const runDisplayLayer =
         resolvedLogging.type === "file"
           ? (() => {
               printFileDisplayStartup({
                 logPath: resolvedLogging.path,
-                rawLogPath: rawLogFilePath,
                 agentName: opts.name,
                 branch: worktreeInfo.branch,
               });
@@ -605,12 +607,14 @@ export const createWorktree = async (
       // 6. Build a SandboxFactory that reuses the started sandbox
       const reuseFactoryLayer = Layer.succeed(SandboxFactory, {
         withSandbox: (makeEffect) =>
-          makeEffect({
-            hostWorktreePath: worktreeInfo.path,
-            sandboxRepoPath: sandboxRepoDir,
-            applyToHost,
-          }).pipe(
-            Effect.provide(sandboxLayer),
+          makeEffect(
+            {
+              hostWorktreePath: worktreeInfo.path,
+              sandboxRepoPath: sandboxRepoDir,
+              applyToHost,
+            },
+            sandbox,
+          ).pipe(
             Effect.map((value) => ({
               value,
               preservedWorktreePath: undefined,
@@ -618,16 +622,16 @@ export const createWorktree = async (
           ) as any,
       });
 
-      const agentStreamEmitterLayer =
-        resolvedLogging.type === "file" && resolvedLogging.onAgentStreamEvent
-          ? callbackAgentStreamEmitterLayer(resolvedLogging.onAgentStreamEvent)
-          : noopAgentStreamEmitterLayer;
+      const streamEmitterLayer = agentStreamEmitterLayer(
+        resolvedLogging.type === "file"
+          ? resolvedLogging.onAgentStreamEvent
+          : undefined,
+      );
 
       const runLayer = Layer.mergeAll(
         reuseFactoryLayer,
         runDisplayLayer,
-        defaultSessionPathsLayer,
-        agentStreamEmitterLayer,
+        streamEmitterLayer,
       );
 
       // 7. Run orchestration
@@ -635,7 +639,7 @@ export const createWorktree = async (
         const display = yield* Display;
         yield* display.intro(opts.name ?? "sandcastle");
 
-        return yield* orchestrate({
+        const orchestrateResult = yield* orchestrate({
           hostRepoDir,
           iterations: maxIterations,
           hooks,
@@ -644,12 +648,27 @@ export const createWorktree = async (
           provider,
           completionSignal: opts.completionSignal,
           idleTimeoutSeconds: opts.idleTimeoutSeconds,
+          completionTimeoutSeconds: opts.completionTimeoutSeconds,
           name: opts.name,
           resumeSession: opts.resumeSession,
           signal: opts.signal,
           skipPromptExpansion: isInlinePrompt,
-          rawLogFilePath,
+          timeouts: options.timeouts,
         });
+
+        const completion = buildCompletionMessage(
+          orchestrateResult.completionSignal,
+          orchestrateResult.iterations.length,
+        );
+        yield* display.status(completion.message, completion.severity);
+
+        for (const line of buildContextWindowLines(
+          orchestrateResult.iterations,
+        )) {
+          yield* display.text(line);
+        }
+
+        return orchestrateResult;
       }).pipe(
         Effect.provide(runLayer),
         // Always close sandbox handle
@@ -664,7 +683,6 @@ export const createWorktree = async (
         branch: result.branch,
         logFilePath:
           resolvedLogging.type === "file" ? resolvedLogging.path : undefined,
-        rawLogFilePath,
       } satisfies WorktreeRunResult;
     });
 
