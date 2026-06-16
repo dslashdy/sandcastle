@@ -543,6 +543,211 @@ describe("InitService scaffold", () => {
     });
   });
 
+  describe("adversarial-best-of-n template", () => {
+    it("produces main.mts, generate.md, critique.md, and revise.md", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const configDir = join(dir, ".sandcastle");
+      const { access } = await import("node:fs/promises");
+
+      await expect(
+        access(join(configDir, "main.mts")),
+      ).resolves.toBeUndefined();
+      await expect(
+        access(join(configDir, "generate.md")),
+      ).resolves.toBeUndefined();
+      await expect(
+        access(join(configDir, "critique.md")),
+      ).resolves.toBeUndefined();
+      await expect(
+        access(join(configDir, "revise.md")),
+      ).resolves.toBeUndefined();
+    });
+
+    it("appears in listTemplates()", () => {
+      const templates = listTemplates();
+      expect(templates.some((t) => t.name === "adversarial-best-of-n")).toBe(
+        true,
+      );
+    });
+
+    it("main.mts imports from @ai-hero/sandcastle", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain('"@ai-hero/sandcastle"');
+    });
+
+    it("states the asymmetric-authority rule in a header comment", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("ASYMMETRIC AUTHORITY");
+    });
+
+    it("pins a heterogeneous model lineup explicitly (survives the init model rewrite)", async () => {
+      const dir = await makeDir();
+      // Even with an explicit --model, the lineup's option-arg factory calls
+      // are not rewritten, so the pinned models remain.
+      await runScaffold(dir, {
+        templateName: "adversarial-best-of-n",
+        model: "claude-haiku-4-5",
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("claude-opus-4-8");
+      expect(mainTs).toContain("claude-sonnet-4-8");
+      expect(mainTs).toContain("gpt-5.5");
+    });
+
+    it("every node runs a single iteration (no maxIterations loop)", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("maxIterations: 1");
+      expect(mainTs).not.toContain("maxIterations: 100");
+    });
+
+    it("uses a named branch strategy, never merge-to-head", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("branchStrategy");
+      expect(mainTs).not.toContain("merge-to-head");
+    });
+
+    it("marks the two TODO seams (fetchIssues + complexity tool)", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("TODO");
+      expect(mainTs).toContain("fetchIssues");
+      expect(mainTs).toContain("complexityReport");
+    });
+
+    it("generate.md passes the issue body but not the ranking metrics", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const prompt = await readFile(
+        join(dir, ".sandcastle", "generate.md"),
+        "utf-8",
+      );
+      expect(prompt).toContain("{{ISSUE_BODY}}");
+      // Generators must be blind to the axes they will be ranked on.
+      expect(prompt).not.toContain("cognitive complexity");
+      expect(prompt).not.toContain("interface surface");
+      expect(prompt).not.toContain("net lines");
+    });
+
+    it("critique.md grants veto power but withholds approval", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const prompt = await readFile(
+        join(dir, ".sandcastle", "critique.md"),
+        "utf-8",
+      );
+      expect(prompt).toContain(".sandcastle/review.json");
+      expect(prompt).toContain("may not approve");
+    });
+
+    it("getNextStepsLines points at the Linear and complexity-tool seams", () => {
+      const lines = getNextStepsLines("adversarial-best-of-n", "main.ts");
+      const joined = lines.join("\n");
+      expect(joined).toContain("fetchIssues");
+      expect(joined).toContain("Linear");
+      expect(joined).toContain("complexity");
+    });
+
+    it("Dockerfile bundles the Python gate toolchain", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const dockerfile = await readFile(
+        join(dir, ".sandcastle", "Dockerfile"),
+        "utf-8",
+      );
+      expect(dockerfile).toContain("pip3 install");
+      for (const tool of [
+        "ruff",
+        "mypy",
+        "pytest",
+        "hypothesis",
+        "complexipy",
+      ]) {
+        expect(dockerfile, tool).toContain(tool);
+      }
+      // The agent CLI install must still be present (toolchain is additive).
+      expect(dockerfile).toContain("FROM node:22-bookworm");
+      expect(dockerfile).not.toContain("{{TEMPLATE_TOOLS}}");
+    });
+
+    it("the gate runs the toolchain inside a per-issue container, not on the host", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("withIssueContainer");
+      expect(mainTs).toContain("SANDCASTLE_CONTAINER_CLI");
+      expect(mainTs).toContain("/host-repo");
+    });
+
+    it("names candidate branches with a hyphen to avoid the git ref D/F conflict", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      // The candidate-branch construction must interpolate with a hyphen.
+      // (The explanatory comment mentions the rejected `/cand-<k>` slash form,
+      // so we target the `${k}` code form specifically, not the `<k>` comment.)
+      expect(mainTs).toContain("-cand-${k}");
+      expect(mainTs).not.toContain("/cand-${k}");
+    });
+  });
+
+  it("non-adversarial templates do not get the Python toolchain block", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, { templateName: "simple-loop" });
+
+    const dockerfile = await readFile(
+      join(dir, ".sandcastle", "Dockerfile"),
+      "utf-8",
+    );
+    expect(dockerfile).not.toContain("complexipy");
+    expect(dockerfile).not.toContain("{{TEMPLATE_TOOLS}}");
+  });
+
   it("simple-loop template does not scaffold compiled .js or .d.ts files", async () => {
     const dir = await makeDir();
     await runScaffold(dir, { templateName: "simple-loop" });

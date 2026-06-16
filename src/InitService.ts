@@ -38,6 +38,11 @@ const TEMPLATES: TemplateMetadata[] = [
     description:
       "Plans parallelizable issues, executes with per-branch review, merges",
   },
+  {
+    name: "adversarial-best-of-n",
+    description:
+      "Best-of-N candidates per issue; a deterministic gate (not the LLM) decides which merges",
+  },
 ];
 
 export const listTemplates = (): TemplateMetadata[] => TEMPLATES;
@@ -67,7 +72,7 @@ RUN apt-get update && apt-get install -y \\
 
 {{BACKLOG_MANAGER_TOOLS}}
 
-# Build-args for UID/GID alignment: sandcastle docker build-image
+{{TEMPLATE_TOOLS}}# Build-args for UID/GID alignment: sandcastle docker build-image
 # defaults these to the host user's UID/GID so image-built files
 # and bind-mounted files share an owner without runtime chown.
 ARG AGENT_UID=1000
@@ -102,7 +107,7 @@ RUN apt-get update && apt-get install -y \\
 
 {{BACKLOG_MANAGER_TOOLS}}
 
-# Build-args for UID/GID alignment: sandcastle docker build-image
+{{TEMPLATE_TOOLS}}# Build-args for UID/GID alignment: sandcastle docker build-image
 # defaults these to the host user's UID/GID so image-built files
 # and bind-mounted files share an owner without runtime chown.
 ARG AGENT_UID=1000
@@ -135,7 +140,7 @@ RUN apt-get update && apt-get install -y \\
 
 {{BACKLOG_MANAGER_TOOLS}}
 
-# Build-args for UID/GID alignment: sandcastle docker build-image
+{{TEMPLATE_TOOLS}}# Build-args for UID/GID alignment: sandcastle docker build-image
 # defaults these to the host user's UID/GID so image-built files
 # and bind-mounted files share an owner without runtime chown.
 ARG AGENT_UID=1000
@@ -168,7 +173,7 @@ RUN apt-get update && apt-get install -y \\
 
 {{BACKLOG_MANAGER_TOOLS}}
 
-# Build-args for UID/GID alignment: sandcastle docker build-image
+{{TEMPLATE_TOOLS}}# Build-args for UID/GID alignment: sandcastle docker build-image
 # defaults these to the host user's UID/GID so image-built files
 # and bind-mounted files share an owner without runtime chown.
 ARG AGENT_UID=1000
@@ -189,6 +194,31 @@ WORKDIR /home/agent
 # Structure your Dockerfile so that \${SANDBOX_REPO_DIR} can serve as the project root.
 ENTRYPOINT ["sleep", "infinity"]
 `;
+
+// Template-specific Dockerfile tool blocks, injected at the {{TEMPLATE_TOOLS}}
+// placeholder during scaffold (as root, before the USER switch). Empty for
+// templates that need no extra tooling.
+const PYTHON_GATE_TOOLS = `# Python toolchain for the adversarial-best-of-n deterministic gate (runs in-container)
+RUN apt-get update && apt-get install -y \\
+  python3 \\
+  python3-pip \\
+  && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages \\
+  ruff \\
+  mypy \\
+  pytest \\
+  hypothesis \\
+  complexipy
+
+`;
+
+const TEMPLATE_DOCKERFILE_TOOLS: Record<string, string> = {
+  "adversarial-best-of-n": PYTHON_GATE_TOOLS,
+};
+
+const getTemplateDockerfileTools = (templateName: string): string =>
+  TEMPLATE_DOCKERFILE_TOOLS[templateName] ?? "";
 
 const AGENT_REGISTRY: AgentEntry[] = [
   {
@@ -361,6 +391,18 @@ export function getNextStepsLines(
       `3. Customize .sandcastle/${mainFilename} — it uses the JS API (\`run()\`) to control how the agent runs`,
       `4. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
       "5. Run `npm run sandcastle` to start the agent",
+    ];
+  } else if (template === "adversarial-best-of-n") {
+    return [
+      "Next steps:",
+      `1. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
+      "   If you want to use your Claude subscription instead of an API key, see https://github.com/mattpocock/sandcastle/issues/191",
+      `2. Wire the two TODO seams in .sandcastle/${mainFilename}: \`fetchIssues()\` (against the Linear API — add LINEAR_API_KEY to .sandcastle/.env) and \`complexityReport()\` (parse a cognitive-complexity tool — complexipy is preinstalled in the image; use lizard for C++)`,
+      `3. Build the sandbox image (e.g. \`sandcastle docker build-image\`) — the Dockerfile bundles the Python gate toolchain (ruff, mypy, pytest, hypothesis, complexipy). The deterministic gate runs these inside a per-issue container, so you do NOT install them on the host`,
+      `4. Review the pinned model lineup and config (N, COMPLEXITY_CEILING, NESTING_MAX) in .sandcastle/${mainFilename} — the lineup is intentionally multi-model; keep it diverse`,
+      `5. Set SANDCASTLE_CONTAINER_CLI (docker/podman) and SANDCASTLE_IMAGE if your runtime or image name differs from the defaults`,
+      `6. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
+      "7. Run `npm run sandcastle` to start the orchestrator",
     ];
   } else {
     const hasReviewer = template.includes("review");
@@ -590,6 +632,42 @@ const substituteTemplateArgs = (
     );
   });
 
+/**
+ * Replace the `{{TEMPLATE_TOOLS}}` placeholder in the scaffolded Dockerfile (and
+ * any other text file) with the selected template's tool block. Templates that
+ * need no extra tooling substitute an empty string.
+ */
+const substituteTemplateTools = (
+  configDir: string,
+  templateName: string,
+): Effect.Effect<void, Error, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const tools = getTemplateDockerfileTools(templateName);
+    const files = yield* fs
+      .readDirectory(configDir)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    const textFiles = files.filter(isTextFile);
+    yield* Effect.all(
+      textFiles.map((f) =>
+        Effect.gen(function* () {
+          const filePath = join(configDir, f);
+          const content = yield* fs
+            .readFileString(filePath)
+            .pipe(Effect.mapError((e) => new Error(e.message)));
+          if (!content.includes("{{TEMPLATE_TOOLS}}")) return;
+          yield* fs
+            .writeFileString(
+              filePath,
+              content.replace(/\{\{TEMPLATE_TOOLS\}\}/g, tools),
+            )
+            .pipe(Effect.mapError((e) => new Error(e.message)));
+        }),
+      ),
+      { concurrency: "unbounded" },
+    );
+  });
+
 // ---------------------------------------------------------------------------
 // Main scaffold function
 // ---------------------------------------------------------------------------
@@ -698,6 +776,9 @@ export const scaffold = (
 
     // Replace backlog manager template arguments in all text files (must run before label stripping)
     yield* substituteTemplateArgs(configDir, backlogManager);
+
+    // Inject the template-specific Dockerfile tool block (empty for most templates)
+    yield* substituteTemplateTools(configDir, templateName);
 
     // Strip --label Sandcastle from prompt files when the user declined label creation
     if (!createLabel) {
