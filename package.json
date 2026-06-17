@@ -64,7 +64,6 @@
   "license": "MIT",
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
-    "@daytona/sdk": "^0.164.0",
     "@effect/vitest": "^0.28.0",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "^7.0.0-dev.20260317.1",
@@ -88,10 +87,10 @@
     "@vercel/sandbox": ">=1.0.0"
   },
   "peerDependenciesMeta": {
-    "@vercel/sandbox": {
+    "@daytona/sdk": {
       "optional": true
     },
-    "@daytona/sdk": {
+    "@vercel/sandbox": {
       "optional": true
     }
   },
