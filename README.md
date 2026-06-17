@@ -33,6 +33,12 @@ Sandcastle is provider-agnostic — it ships with built-in providers for Docker,
 npm install --save-dev @ai-hero/sandcastle
 ```
 
+To install an unreleased build directly from GitHub, pin a commit SHA:
+
+```bash
+npm install --save-dev git+ssh://git@github.com/dslashdy/sandcastle.git#<commit-sha>
+```
+
 2. Run `sandcastle init`. This scaffolds a `.sandcastle` directory with all the files needed.
 
 ```bash
