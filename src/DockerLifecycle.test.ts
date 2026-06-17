@@ -126,11 +126,16 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
-        ],
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
+          ],
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(
@@ -149,11 +154,20 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path", readonly: true },
-        ],
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            {
+              hostPath: "/host/path",
+              sandboxPath: "/sandbox/path",
+              readonly: true,
+            },
+          ],
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(
@@ -171,11 +185,16 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
-        ],
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
+          ],
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(
@@ -193,12 +212,17 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
-        ],
-        selinuxLabel: "Z",
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
+          ],
+          selinuxLabel: "Z",
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(
@@ -216,12 +240,17 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
-        ],
-        selinuxLabel: false,
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            { hostPath: "/host/path", sandboxPath: "/sandbox/path" },
+          ],
+          selinuxLabel: false,
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(
@@ -232,6 +261,37 @@ describe("startContainer", () => {
     expect(runArgs[vIdx + 1]).toBe("/host/path:/sandbox/path");
   });
 
+  it("mount-level selinuxLabel overrides the container-level default", async () => {
+    mockExecFile.mockImplementation((_cmd, _args, _opts, cb: any) => {
+      cb(null, "", "");
+      return undefined as any;
+    });
+
+    await Effect.runPromise(
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            {
+              hostPath: "sandcastle-agent-home",
+              sandboxPath: "/home/agent",
+              selinuxLabel: false,
+            },
+          ],
+        },
+      ),
+    );
+
+    const runCall = mockExecFile.mock.calls.find(
+      ([, args]) => Array.isArray(args) && args[0] === "run",
+    );
+    const runArgs = runCall![1] as string[];
+    const vIdx = runArgs.indexOf("-v");
+    expect(runArgs[vIdx + 1]).toBe("sandcastle-agent-home:/home/agent");
+  });
+
   it("readonly with selinuxLabel false produces :ro only", async () => {
     mockExecFile.mockImplementation((_cmd, _args, _opts, cb: any) => {
       cb(null, "", "");
@@ -239,12 +299,21 @@ describe("startContainer", () => {
     });
 
     await Effect.runPromise(
-      startContainer("ctr", "img", {}, {
-        volumeMounts: [
-          { hostPath: "/host/path", sandboxPath: "/sandbox/path", readonly: true },
-        ],
-        selinuxLabel: false,
-      }),
+      startContainer(
+        "ctr",
+        "img",
+        {},
+        {
+          volumeMounts: [
+            {
+              hostPath: "/host/path",
+              sandboxPath: "/sandbox/path",
+              readonly: true,
+            },
+          ],
+          selinuxLabel: false,
+        },
+      ),
     );
 
     const runCall = mockExecFile.mock.calls.find(

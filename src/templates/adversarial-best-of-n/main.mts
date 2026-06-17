@@ -35,8 +35,9 @@
 //                           re-gate. A repair that breaches the ceiling is
 //                           discarded in favour of the pre-repair winner.
 //   7. Verdict              From the gate, never an LLM. Green → fast-forward
-//                           merge to the issue branch. Red/vetoed → needs-human,
-//                           branch left unmerged.
+//                           merge to the issue branch, merge that branch into
+//                           the local launch branch, then close the issue.
+//                           Red/vetoed → needs-human, branch left unmerged.
 //
 // Each per-issue workflow runs entirely in containers: the generator/critic/
 // reviser nodes each get their own sandbox via run(), and the deterministic
@@ -56,6 +57,7 @@
 
 import * as sandcastle from "@ai-hero/sandcastle";
 import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
+import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
@@ -88,6 +90,8 @@ const REVISE_TIMEOUT = 900;
 /** The repo root the orchestrator runs from (host-side git anchors here). */
 const REPO = process.cwd();
 
+loadSandcastleEnv();
+
 /** Container runtime + image used to run the gate toolchain. Defaults match `sandcastle init`. */
 const CONTAINER_CLI = process.env["SANDCASTLE_CONTAINER_CLI"] ?? "docker";
 const IMAGE = process.env["SANDCASTLE_IMAGE"] ?? defaultImageName(REPO);
@@ -103,28 +107,71 @@ function defaultImageName(repoDir: string): string {
   return `sandcastle:${sanitized || "local"}`;
 }
 
+/**
+ * Load `.sandcastle/.env` for host-side orchestration commands such as
+ * `gh issue list`. Sandcastle injects env vars into sandboxed agents, but this
+ * file also does host-side git and issue plumbing before any sandbox starts.
+ */
+function loadSandcastleEnv(): void {
+  const envPath = `${REPO}/.sandcastle/.env`;
+  if (!existsSync(envPath)) return;
+
+  for (const rawLine of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const equalsIndex = line.indexOf("=");
+    if (equalsIndex === -1) continue;
+
+    const key = line.slice(0, equalsIndex).trim();
+    if (!key || process.env[key] !== undefined) continue;
+
+    let value = line.slice(equalsIndex + 1).trim();
+    const quoted =
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"));
+    if (quoted) value = value.slice(1, -1);
+
+    process.env[key] = value;
+  }
+}
+
 // Pinned models — every node names its model explicitly; nothing relies on a
 // framework default. Reasoning effort maps the spec's wording to the provider
 // option: Claude "extra" → effort "max" (top of low|medium|high|max); GPT
 // "ext high" → effort "xhigh" (top of low|medium|high|xhigh).
 //
 // The lineup is intentionally heterogeneous (Opus generators + one GPT
-// generator, Sonnet critic, Opus reviser) so best-of-N explores genuinely
-// different solution shapes rather than N samples of one model. `sandcastle
-// init` may rewrite the agent family if you selected a non-Claude agent —
-// keep the lineup diverse when you customize.
-const opusGenerator = (): sandcastle.AgentProvider =>
-  sandcastle.claudeCode("claude-opus-4-8", { effort: "max" });
-const gptGenerator = (): sandcastle.AgentProvider =>
-  sandcastle.codex("gpt-5.5", { effort: "xhigh" });
-const CRITIC_AGENT: sandcastle.AgentProvider = sandcastle.claudeCode(
-  "claude-sonnet-4-8",
-  { effort: "max" },
-);
-const REVISE_AGENT: sandcastle.AgentProvider = sandcastle.claudeCode(
-  "claude-opus-4-8",
-  { effort: "max" },
-);
+// generator, Opus critic/reviser) so best-of-N explores genuinely different
+// solution shapes rather than N samples of one model. `sandcastle init` may
+// rewrite the agent family if you selected a non-Claude agent — keep the
+// lineup diverse when you customize.
+const CLAUDE_GENERATOR_MODEL = "claude-opus-4-8";
+const GPT_GENERATOR_MODEL = "gpt-5.5";
+const CRITIC_MODEL = "claude-opus-4-8";
+const REVISE_MODEL = "claude-opus-4-8";
+
+interface LabeledAgent {
+  readonly provider: sandcastle.AgentProvider;
+  readonly label: string;
+}
+
+const opusGenerator = (): LabeledAgent => ({
+  provider: sandcastle.claudeCode(CLAUDE_GENERATOR_MODEL, { effort: "max" }),
+  label: `claude-code:${CLAUDE_GENERATOR_MODEL} effort=max`,
+});
+const gptGenerator = (): LabeledAgent => ({
+  provider: sandcastle.codex(GPT_GENERATOR_MODEL, { effort: "xhigh" }),
+  label: `codex:${GPT_GENERATOR_MODEL} effort=xhigh`,
+});
+const CRITIC_AGENT: LabeledAgent = {
+  provider: sandcastle.claudeCode(CRITIC_MODEL, { effort: "max" }),
+  label: `claude-code:${CRITIC_MODEL} effort=max`,
+};
+const REVISE_AGENT: LabeledAgent = {
+  provider: sandcastle.claudeCode(REVISE_MODEL, { effort: "max" }),
+  label: `claude-code:${REVISE_MODEL} effort=max`,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -184,24 +231,114 @@ const candidateBranch = (issue: Issue, k: number): string =>
   `agent/issue-${issue.id}-cand-${k}`;
 
 // ---------------------------------------------------------------------------
-// Seam: issue source (TODO — wire to Linear)
+// Issue source
 // ---------------------------------------------------------------------------
 
-/**
- * Return the Linear issues that are ready to work, as `{ id, title, body }`.
- *
- * TODO: implement against the Linear API. Read the token from the environment
- * (e.g. `process.env.LINEAR_API_KEY`, set in .sandcastle/.env) — do not hardcode
- * credentials. Query the GraphQL endpoint for issues in your "ready" state and
- * map each to `{ id, title, body }`. Until this is wired the orchestrator has
- * nothing to do and exits non-zero.
- */
-async function fetchIssues(): Promise<Issue[]> {
-  throw new Error(
-    "TODO: implement fetchIssues() against the Linear API — return the " +
-      "ready-to-work issues as { id, title, body }[]. Read LINEAR_API_KEY from " +
-      "the environment; do not hardcode credentials.",
+const LIST_TASKS_COMMAND = `{{LIST_TASKS_COMMAND}}`;
+const CLOSE_TASK_COMMAND = `{{CLOSE_TASK_COMMAND}}`;
+
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+  value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+
+const textValue = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
+};
+
+const commentText = (value: unknown): string | undefined => {
+  const direct = textValue(value);
+  if (direct) return direct;
+
+  const record = asRecord(value);
+  if (!record) return undefined;
+
+  return (
+    textValue(record["body"]) ??
+    textValue(record["text"]) ??
+    textValue(record["content"])
   );
+};
+
+function normalizeIssue(raw: unknown, index: number): Issue | undefined {
+  const task = asRecord(raw);
+  if (!task) return undefined;
+
+  const id = textValue(
+    task["id"] ??
+      task["number"] ??
+      task["identifier"] ??
+      task["key"] ??
+      index + 1,
+  );
+  if (!id) return undefined;
+
+  const title =
+    textValue(task["title"] ?? task["summary"] ?? task["name"]) ?? `Task ${id}`;
+  const body = textValue(
+    task["body"] ?? task["description"] ?? task["content"],
+  );
+
+  const comments = Array.isArray(task["comments"])
+    ? task["comments"]
+        .map(commentText)
+        .filter((comment): comment is string => comment !== undefined)
+    : [];
+  const commentSection =
+    comments.length > 0
+      ? "\n\nComments:\n\n" +
+        comments
+          .map(
+            (comment, commentIndex) =>
+              `Comment ${commentIndex + 1}:\n${comment}`,
+          )
+          .join("\n\n")
+      : "";
+
+  return {
+    id,
+    title,
+    body: `${body ?? ""}${commentSection}`.trim(),
+  };
+}
+
+async function fetchIssues(): Promise<Issue[]> {
+  const result = spawnSync(LIST_TASKS_COMMAND, {
+    cwd: REPO,
+    encoding: "utf8",
+    shell: true,
+    env: process.env,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+
+  if (result.status !== 0) {
+    throw new Error(
+      `issue list command failed: ${result.stderr.trim() || result.stdout.trim()}`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`issue list command did not return JSON: ${message}`);
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("issue list command must return a JSON array");
+  }
+
+  const issues: Issue[] = [];
+  for (const [index, task] of parsed.entries()) {
+    const issue = normalizeIssue(task, index);
+    if (issue) issues.push(issue);
+  }
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +373,16 @@ function ensureBranch(branch: string, base: string): void {
 
 const tipSha = (ref: string): string => gitOut(["rev-parse", ref]).trim();
 
+function currentBranch(): string {
+  const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+  if (!branch || branch === "HEAD") {
+    throw new Error(
+      "adversarial-best-of-n requires a named launch branch; detached HEAD is not supported",
+    );
+  }
+  return branch;
+}
+
 /** Move a branch ref without touching any working tree. */
 const resetBranch = (branch: string, sha: string): void =>
   void gitOut(["branch", "-f", branch, sha]);
@@ -243,6 +390,58 @@ const resetBranch = (branch: string, sha: string): void =>
 /** Fast-forward `target` to `source` via a self-fetch — succeeds only if it is a true ff. */
 const ffMerge = (target: string, source: string): boolean =>
   git(["fetch", ".", `${source}:${target}`]).status === 0;
+
+function commitsAhead(source: string, base: string): number {
+  const result = git(["rev-list", `${base}..${source}`, "--count"]);
+  if (result.status !== 0) return 0;
+  const count = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(count) ? count : 0;
+}
+
+function commandError(result: ReturnType<typeof spawnSync>): string {
+  return (
+    String(result.stderr ?? "").trim() ||
+    String(result.stdout ?? "").trim() ||
+    `exit ${result.status ?? "unknown"}`
+  );
+}
+
+function mergeIntoLaunchBranch(
+  sourceBranch: string,
+  launchBranch: string,
+): { ok: true } | { ok: false; error: string } {
+  const activeBranch = currentBranch();
+  if (activeBranch !== launchBranch) {
+    return {
+      ok: false,
+      error: `current branch changed from ${launchBranch} to ${activeBranch}`,
+    };
+  }
+
+  const result = git(["merge", "--no-edit", sourceBranch]);
+  if (result.status !== 0) {
+    return { ok: false, error: commandError(result) };
+  }
+  return { ok: true };
+}
+
+function closeIssue(
+  issue: Issue,
+): { ok: true } | { ok: false; error: string } {
+  const command = CLOSE_TASK_COMMAND.replaceAll("<ID>", shellQuote(issue.id));
+  const result = spawnSync(command, {
+    cwd: REPO,
+    encoding: "utf8",
+    shell: true,
+    env: process.env,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+
+  if (result.status !== 0) {
+    return { ok: false, error: commandError(result) };
+  }
+  return { ok: true };
+}
 
 // ---------------------------------------------------------------------------
 // Per-issue gate container (the toolchain lives in the image, not on the host)
@@ -278,6 +477,9 @@ function execIn(
   const r = cli(["exec", name, "sh", "-c", script]);
   return { code: r.status ?? 1, stdout: r.stdout, stderr: r.stderr };
 }
+
+const shellQuote = (value: string): string =>
+  `'${value.replace(/'/g, "'\\''")}'`;
 
 /**
  * Start one detached container per issue from the sandbox image (toolchain
@@ -328,24 +530,132 @@ function checkoutInContainer(name: string, branch: string): string | null {
 
 /**
  * Cognitive-complexity + nesting report for a checkout inside the container
- * (TODO — wire the tool's output parsing).
- *
- * TODO: complexipy is installed in the image. Run it against `dir` inside the
- * container and parse its machine-readable output, e.g.:
- *   const { stdout } = execIn(name, `cd ${dir} && complexipy -o json . >/dev/null && cat *.json`);
- *   const report = JSON.parse(stdout) as { ... };
- * Return the WORST function's cognitive complexity and the MAX nesting depth.
- * This is the most important deterministic precondition — keep it exact.
+ * using complexipy plus a small Python AST nesting walker.
  */
 function complexityReport(
   name: string,
   dir: string,
 ): { worstComplexity: number; maxNesting: number } {
-  throw new Error(
-    "TODO: implement complexityReport() — complexipy is installed in the image; " +
-      `run it in container ${name} against ${dir} and parse worstComplexity + maxNesting.`,
+  const reportPath = `/tmp/sandcastle-complexity-${sanitizeRef(dir)}.json`;
+  const complexityScript = [
+    `rm -f ${shellQuote(reportPath)}`,
+    `cd ${shellQuote(dir)}`,
+    `complexipy --output-format json --output ${shellQuote(reportPath)} --ignore-complexity . >/tmp/sandcastle-complexity.out 2>/tmp/sandcastle-complexity.err`,
+    "code=$?",
+    'if [ "$code" -ne 0 ]; then',
+    "  cat /tmp/sandcastle-complexity.out /tmp/sandcastle-complexity.err >&2",
+    '  exit "$code"',
+    "fi",
+    `cat ${shellQuote(reportPath)}`,
+  ].join("\n");
+
+  const complexity = execIn(name, complexityScript);
+  if (complexity.code !== 0) {
+    throw new Error(
+      `complexipy failed in ${name} for ${dir}: ${complexity.stderr.trim()}`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(complexity.stdout);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`complexipy output was not JSON: ${message}`);
+  }
+
+  const worstComplexity = maxComplexity(parsed);
+  const nesting = execIn(
+    name,
+    `python3 -c ${shellQuote(MAX_NESTING_SCRIPT)} ${shellQuote(dir)}`,
   );
+  if (nesting.code !== 0) {
+    throw new Error(
+      `nesting analysis failed in ${name} for ${dir}: ${nesting.stderr.trim()}`,
+    );
+  }
+
+  const maxNesting = Number.parseInt(nesting.stdout.trim(), 10);
+  return {
+    worstComplexity,
+    maxNesting: Number.isFinite(maxNesting) ? maxNesting : 0,
+  };
 }
+
+function maxComplexity(value: unknown): number {
+  let max = 0;
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const record = asRecord(node);
+    if (!record) return;
+
+    if (typeof record["complexity"] === "number") {
+      max = Math.max(max, record["complexity"]);
+    }
+    for (const child of Object.values(record)) visit(child);
+  };
+  visit(value);
+  return max;
+}
+
+const MAX_NESTING_SCRIPT = String.raw`
+import ast
+import os
+import sys
+
+root = sys.argv[1]
+block_nodes = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.Try,
+)
+if hasattr(ast, "Match"):
+    block_nodes = block_nodes + (ast.Match,)
+
+max_depth = 0
+
+
+class Visitor(ast.NodeVisitor):
+    def __init__(self):
+        self.depth = 0
+
+    def generic_visit(self, node):
+        global max_depth
+        is_block = isinstance(node, block_nodes)
+        if is_block:
+            self.depth += 1
+            max_depth = max(max_depth, self.depth)
+        super().generic_visit(node)
+        if is_block:
+            self.depth -= 1
+
+
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [
+        name
+        for name in dirnames
+        if name not in {".git", ".mypy_cache", ".pytest_cache", "__pycache__", "node_modules"}
+    ]
+    for filename in filenames:
+        if not filename.endswith(".py"):
+            continue
+        path = os.path.join(dirpath, filename)
+        try:
+            with open(path, "r", encoding="utf8") as handle:
+                tree = ast.parse(handle.read(), filename=path)
+        except SyntaxError:
+            continue
+        Visitor().visit(tree)
+
+print(max_depth)
+`;
 
 /** Diff-derived metrics vs the issue base. Excludes `.sandcastle/` orchestration artifacts. */
 function diffMetrics(
@@ -557,7 +867,7 @@ function dispersion(survivors: Candidate[]): boolean {
 // Agent nodes (each its own run(); iteration comes from the orchestrator)
 // ---------------------------------------------------------------------------
 
-function generatorLineup(n: number): sandcastle.AgentProvider[] {
+function generatorLineup(n: number): LabeledAgent[] {
   // Last slot is a different model family so best-of-N has genuine diversity;
   // guarantees ≥1 GPT generator whenever n >= 2.
   return Array.from({ length: n }, (_unused, i) =>
@@ -569,13 +879,13 @@ function generatorLineup(n: number): sandcastle.AgentProvider[] {
 async function generate(
   issue: Issue,
   k: number,
-  agent: sandcastle.AgentProvider,
+  agent: LabeledAgent,
 ): Promise<{ branch: string; commits: number }> {
   const branch = candidateBranch(issue, k);
   const result = await sandcastle.run({
     name: `generate-${issue.id}-${k}`,
     sandbox: docker(),
-    agent,
+    agent: agent.provider,
     maxIterations: 1,
     promptFile: ".sandcastle/generate.md",
     // Issue body only — generators must never see the ranking metrics.
@@ -592,10 +902,11 @@ async function generate(
 
 /** Critic node — writes & commits `.sandcastle/review.json` on the winner branch. May veto, never approves. */
 async function critique(winner: string): Promise<void> {
+  console.log(`  critic model: ${CRITIC_AGENT.label}`);
   await sandcastle.run({
     name: "critique",
     sandbox: docker(),
-    agent: CRITIC_AGENT,
+    agent: CRITIC_AGENT.provider,
     maxIterations: 1,
     promptFile: ".sandcastle/critique.md",
     branchStrategy: { type: "branch", branch: winner },
@@ -617,10 +928,11 @@ function readReview(winner: string): ReviewItem[] {
 
 /** Revise node — applies ONLY the listed fixes on the winner branch. */
 async function revise(winner: string, items: ReviewItem[]): Promise<void> {
+  console.log(`  revise model: ${REVISE_AGENT.label}`);
   await sandcastle.run({
     name: "revise",
     sandbox: docker(),
-    agent: REVISE_AGENT,
+    agent: REVISE_AGENT.provider,
     maxIterations: 1,
     promptFile: ".sandcastle/revise.md",
     promptArgs: { REVIEW_JSON: JSON.stringify(items, null, 2) },
@@ -643,14 +955,61 @@ function finish(
   return { status, branch };
 }
 
+function mergeAndCloseIssue(
+  issue: Issue,
+  issueBranchName: string,
+  launchBranch: string,
+  status: Status,
+  successReason: string,
+): { status: Status; branch: string } {
+  const merge = mergeIntoLaunchBranch(issueBranchName, launchBranch);
+  if (!merge.ok) {
+    return finish(
+      launchBranch,
+      "needs-human",
+      `local merge of ${issueBranchName} failed: ${merge.error}`,
+    );
+  }
+  console.log(`  ✓ merged ${issueBranchName} into ${launchBranch}`);
+
+  const close = closeIssue(issue);
+  if (!close.ok) {
+    return finish(
+      launchBranch,
+      "needs-human",
+      `merged ${issueBranchName} into ${launchBranch}, but close failed: ${close.error}`,
+    );
+  }
+  console.log(`  ✓ closed issue ${issue.id}`);
+
+  return finish(launchBranch, status, successReason);
+}
+
 async function processIssue(
   issue: Issue,
+  launchBranch: string,
 ): Promise<{ status: Status; branch: string }> {
   const target = issueBranch(issue);
   ensureBranch(target, BASE_REF);
 
+  if (commitsAhead(target, launchBranch) > 0) {
+    console.log(
+      `  existing ${target} has commits not in ${launchBranch}; merging before generating candidates`,
+    );
+    return mergeAndCloseIssue(
+      issue,
+      target,
+      launchBranch,
+      "clean",
+      `merged existing ${target} and closed issue`,
+    );
+  }
+
   // 1. Best-of-N generate (parallel; one failing generator must not sink the rest).
   const lineup = generatorLineup(N);
+  for (const [i, agent] of lineup.entries()) {
+    console.log(`  cand-${i + 1} generator model: ${agent.label}`);
+  }
   const settled = await Promise.allSettled(
     lineup.map((agent, i) => generate(issue, i + 1, agent)),
   );
@@ -741,7 +1100,8 @@ async function processIssue(
       }
     }
 
-    // 7. Verdict from the gate: fast-forward merge the winner to the issue branch.
+    // 7. Verdict from the gate: fast-forward merge the winner to the issue
+    // branch, merge that local issue branch into the launch branch, then close.
     if (!ffMerge(target, winner)) {
       return finish(
         target,
@@ -749,12 +1109,14 @@ async function processIssue(
         `fast-forward merge into ${target} failed`,
       );
     }
-    return finish(
+    return mergeAndCloseIssue(
+      issue,
       target,
+      launchBranch,
       status,
       status === "passed-after-repair"
-        ? "merged after one repair"
-        : "merged clean",
+        ? `merged ${target} after one repair and closed issue`
+        : `merged ${target} clean and closed issue`,
     );
   });
 }
@@ -769,10 +1131,11 @@ async function main(): Promise<void> {
     console.log("No ready-to-work issues.");
     return;
   }
+  const launchBranch = currentBranch();
   for (const issue of issues) {
     console.log(`\n=== Issue ${issue.id}: ${issue.title} ===`);
     try {
-      await processIssue(issue);
+      await processIssue(issue, launchBranch);
     } catch (err) {
       // A node or a host check threw — the gate never went green for this
       // issue, so it is needs-human. Log the mandated line and keep going.

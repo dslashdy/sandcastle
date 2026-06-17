@@ -138,6 +138,11 @@ describe("docker()", () => {
     expect(provider.tag).toBe("bind-mount");
   });
 
+  it("accepts a persistentHome option", () => {
+    const provider = docker({ persistentHome: true });
+    expect(provider.tag).toBe("bind-mount");
+  });
+
   it("runs pre-flight docker image inspect before docker run", async () => {
     const callOrder: string[] = [];
     mockExecFile.mockImplementation((_command, args, ...rest: any[]) => {
@@ -404,6 +409,68 @@ describe("docker()", () => {
     const vIdx = runArgs.indexOf("-v");
     expect(vIdx).toBeGreaterThan(-1);
     expect(runArgs[vIdx + 1]).toMatch(/:z$/);
+
+    await handle.close();
+  });
+
+  it("mounts persistent home before the workspace when persistentHome is enabled", async () => {
+    mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+      const callback = rest[rest.length - 1];
+      callback(null, "", "");
+      return undefined as any;
+    });
+
+    const provider = docker({ persistentHome: true });
+    const handle = await provider.create({
+      worktreePath: "/tmp/worktree",
+      hostRepoPath: "/tmp/My Repo",
+      mounts: [
+        { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+      ],
+      env: {},
+    });
+
+    const runCall = mockExecFile.mock.calls.find(
+      ([, args]) => Array.isArray(args) && args[0] === "run",
+    );
+    const runArgs = runCall![1] as string[];
+    const firstVIdx = runArgs.indexOf("-v");
+    const secondVIdx = runArgs.indexOf("-v", firstVIdx + 1);
+    expect(runArgs[firstVIdx + 1]).toBe(
+      "sandcastle-my-repo-agent-home:/home/agent",
+    );
+    expect(runArgs[secondVIdx + 1]).toBe(
+      "/tmp/worktree:/home/agent/workspace:z",
+    );
+
+    await handle.close();
+  });
+
+  it("uses a custom persistent home volume name when provided", async () => {
+    mockExecFile.mockImplementation((_command, _args, ...rest: any[]) => {
+      const callback = rest[rest.length - 1];
+      callback(null, "", "");
+      return undefined as any;
+    });
+
+    const provider = docker({
+      persistentHome: { volumeName: "custom-agent-home" },
+    });
+    const handle = await provider.create({
+      worktreePath: "/tmp/worktree",
+      hostRepoPath: "/tmp/repo",
+      mounts: [
+        { hostPath: "/tmp/worktree", sandboxPath: "/home/agent/workspace" },
+      ],
+      env: {},
+    });
+
+    const runCall = mockExecFile.mock.calls.find(
+      ([, args]) => Array.isArray(args) && args[0] === "run",
+    );
+    const runArgs = runCall![1] as string[];
+    const firstVIdx = runArgs.indexOf("-v");
+    expect(runArgs[firstVIdx + 1]).toBe("custom-agent-home:/home/agent");
 
     await handle.close();
   });

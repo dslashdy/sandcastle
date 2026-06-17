@@ -39,10 +39,11 @@ npm install --save-dev @ai-hero/sandcastle
 npx sandcastle init
 ```
 
-3. Edit `.sandcastle/.env` and fill in your default values for `ANTHROPIC_API_KEY`. If you want to use your Claude subscription instead of an API key, see [#191](https://github.com/mattpocock/sandcastle/issues/191).
+3. Edit `.sandcastle/.env` and fill in any remaining env vars. If you selected GitHub Issues during init, Sandcastle can save `GH_TOKEN` for you. If you want to use Claude/Codex subscription login instead of API keys, run the generated login helper after the Docker image is built.
 
 ```bash
-cp .sandcastle/.env.example .sandcastle/.env
+cp .sandcastle/.env.example .sandcastle/.env # if init did not create one
+npx tsx .sandcastle/login.mts
 ```
 
 4. Run the `.sandcastle/main.ts` (or `main.mts`) file with `npx tsx`
@@ -139,6 +140,10 @@ const result = await run({
     // Must match the UID baked into the image. Pre-flight check catches mismatches.
     // containerUid: 1000,
     // containerGid: 1000,
+    // Optional: persist /home/agent in a Docker named volume.
+    // Useful for trusted local/private Docker images where claude/codex login
+    // should survive Sandcastle container teardown.
+    persistentHome: true,
     // Optional: mount host directories into the sandbox (e.g. package manager caches)
     // hostPath supports absolute, tilde-expanded (~), and relative paths (resolved from cwd).
     // sandboxPath supports absolute and relative paths (resolved from the sandbox repo directory).
@@ -634,14 +639,14 @@ console.log(result.output.score); // typed as number
 
 `sandcastle init` prompts you to choose a sandbox provider (Docker or Podman), a backlog manager (GitHub Issues or Beads), and a template, which scaffolds a ready-to-use prompt and `main.mts` suited to a specific workflow. If your project's `package.json` has `"type": "module"`, the file will be named `main.ts` instead. Six templates are available:
 
-| Template                       | Description                                                                             |
-| ------------------------------ | --------------------------------------------------------------------------------------- |
-| `blank`                        | Bare scaffold — write your own prompt and orchestration                                 |
-| `simple-loop`                  | Picks issues one by one and closes them                                                 |
-| `sequential-reviewer`          | Implements issues one by one, with a code review step after each                        |
-| `parallel-planner`             | Plans parallelizable issues, executes on separate branches, then merges                 |
-| `parallel-planner-with-review` | Plans parallelizable issues, executes with per-branch review, then merges               |
-| `adversarial-best-of-n`        | Best-of-N candidates per issue; a deterministic gate (not the LLM) decides which merges |
+| Template                       | Description                                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `blank`                        | Bare scaffold — write your own prompt and orchestration                                  |
+| `simple-loop`                  | Picks issues one by one and closes them                                                  |
+| `sequential-reviewer`          | Implements issues one by one, with a code review step after each                         |
+| `parallel-planner`             | Plans parallelizable issues, executes on separate branches, then merges                  |
+| `parallel-planner-with-review` | Plans parallelizable issues, executes with per-branch review, then merges                |
+| `adversarial-best-of-n`        | Best-of-N candidates per issue; a deterministic gate decides, merges locally, and closes |
 
 Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one.
 
@@ -834,6 +839,18 @@ await run({
 - When `env` is not provided, it defaults to `{}`
 
 Environment variables are also resolved automatically from `.sandcastle/.env` and `process.env` — no need to pass them to the API. The required variables depend on the **agent provider** (see `sandcastle init` output for details).
+
+### Persistent Docker Login
+
+Docker scaffolds use `docker({ persistentHome: true })`, which mounts `/home/agent` from a Docker named volume. The generated `.sandcastle/login.mts` helper runs `claude login` and `codex login --device-auth` inside the project image with the same volume mounted:
+
+```bash
+npx tsx .sandcastle/login.mts        # both
+npx tsx .sandcastle/login.mts claude # Claude only
+npx tsx .sandcastle/login.mts codex  # Codex only
+```
+
+The volume can contain auth tokens. Use this only for trusted local/private Docker hosts and images.
 
 ## Custom Sandbox Providers
 

@@ -67,9 +67,12 @@ export const buildImage = (
   });
 
 export interface VolumeMount {
+  /** Host path or Docker named volume source. */
   readonly hostPath: string;
   readonly sandboxPath: string;
   readonly readonly?: boolean;
+  /** Override the container-level SELinux label for this mount. */
+  readonly selinuxLabel?: SelinuxLabel;
 }
 
 export interface StartContainerOptions {
@@ -125,7 +128,7 @@ export const startContainer = (
     const selinuxLabel = options?.selinuxLabel ?? "z";
     const volumeFlags = (options?.volumeMounts ?? []).flatMap((mount) => [
       "-v",
-      formatVolumeMount(mount, selinuxLabel),
+      formatVolumeMount(mount, mount.selinuxLabel ?? selinuxLabel),
     ]);
 
     const workdirFlags = options?.workdir ? ["-w", options.workdir] : [];

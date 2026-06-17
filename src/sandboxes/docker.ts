@@ -15,7 +15,11 @@ import {
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { Effect } from "effect";
-import { startContainer, removeContainer } from "../DockerLifecycle.js";
+import {
+  startContainer,
+  removeContainer,
+  type VolumeMount,
+} from "../DockerLifecycle.js";
 import {
   createBindMountSandboxProvider,
   type SandboxProvider,
@@ -31,6 +35,17 @@ import {
   resolveUserMounts,
   processFileMountParents,
 } from "../mountUtils.js";
+
+export interface DockerPersistentHomeOptions {
+  /**
+   * Docker named volume used for `/home/agent`.
+   *
+   * Defaults to a repo/image-derived name like `sandcastle-my-repo-agent-home`.
+   * The volume may contain agent auth tokens, so only use this on trusted local
+   * Docker hosts or private images.
+   */
+  readonly volumeName?: string;
+}
 
 export interface DockerOptions {
   /** Docker image name (default: derived from repo directory name). */
@@ -63,6 +78,15 @@ export interface DockerOptions {
    * If `hostPath` does not exist, sandbox creation fails with a clear error.
    */
   readonly mounts?: readonly MountConfig[];
+  /**
+   * Persist `/home/agent` in a Docker named volume.
+   *
+   * This lets interactive logins such as `claude login` or `codex login`
+   * survive Sandcastle's normal container teardown/recreate lifecycle. Docker
+   * seeds a new named volume from the image on first use, so CLIs installed
+   * under `/home/agent` remain available.
+   */
+  readonly persistentHome?: boolean | DockerPersistentHomeOptions;
   /** Environment variables injected by this provider. Merged at launch time with env resolver and agent provider env. */
   readonly env?: Record<string, string>;
   /**
@@ -110,17 +134,36 @@ export const docker = (options?: DockerOptions): SandboxProvider => {
           (m) => m.hostPath === createOptions.worktreePath,
         )?.sandboxPath ?? "/home/agent/workspace";
 
-      // Build volume mount list (internal mounts + user-provided mounts)
-      const allMounts = [...createOptions.mounts, ...userMounts];
-      const volumeMounts = allMounts.map((m) => ({
-        hostPath: m.hostPath,
-        sandboxPath: m.sandboxPath,
-        readonly: m.readonly,
-      }));
-
       // Resolve image name
       const imageName =
         configuredImageName ?? defaultImageName(createOptions.hostRepoPath);
+      const persistentHomeVolumeName = resolvePersistentHomeVolumeName(
+        options?.persistentHome,
+        imageName,
+      );
+
+      // Build volume mount list. If enabled, mount persistent home first so
+      // nested mounts like /home/agent/workspace remain visible.
+      const volumeMounts: VolumeMount[] = [
+        ...(persistentHomeVolumeName
+          ? [
+              {
+                hostPath: persistentHomeVolumeName,
+                sandboxPath: sandboxHomedir,
+                selinuxLabel: false as const,
+              },
+            ]
+          : []),
+        ...createOptions.mounts.map((m) => ({
+          hostPath: m.hostPath,
+          sandboxPath: m.sandboxPath,
+        })),
+        ...userMounts.map((m) => ({
+          hostPath: m.hostPath,
+          sandboxPath: m.sandboxPath,
+          readonly: m.readonly,
+        })),
+      ];
 
       const containerUid = options?.containerUid ?? process.getuid?.() ?? 1000;
       const containerGid = options?.containerGid ?? process.getgid?.() ?? 1000;
@@ -383,3 +426,25 @@ const checkImageUid = (imageName: string, expectedUid: number): Promise<void> =>
       },
     );
   });
+
+const sanitizeVolumeName = (name: string): string => {
+  const sanitized = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]/g, "-")
+    .replace(/^-+/, "");
+  return sanitized || "sandcastle";
+};
+
+export const defaultPersistentHomeVolumeName = (imageName: string): string =>
+  `${sanitizeVolumeName(imageName)}-agent-home`;
+
+const resolvePersistentHomeVolumeName = (
+  config: DockerOptions["persistentHome"],
+  imageName: string,
+): string | undefined => {
+  if (!config) return undefined;
+  if (typeof config === "object" && config.volumeName) {
+    return config.volumeName;
+  }
+  return defaultPersistentHomeVolumeName(imageName);
+};

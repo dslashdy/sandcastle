@@ -39,6 +39,23 @@ const execOk = (
       : Effect.succeed(result),
   );
 
+const shellQuote = (value: string): string =>
+  `'${value.replace(/'/g, "'\\''")}'`;
+
+const gitConfigGlobalCommand = (...args: string[]): string => {
+  const command = ["git", "config", "--global", ...args]
+    .map(shellQuote)
+    .join(" ");
+  const script = [
+    "for attempt in 1 2 3 4 5; do",
+    `  ${command} && exit 0`,
+    "  sleep 0.2",
+    "done",
+    command,
+  ].join("\n");
+  return `sh -c ${shellQuote(script)}`;
+};
+
 const execOkWithGitTimeout = (
   sandbox: SandboxService,
   command: string,
@@ -197,7 +214,7 @@ export const withSandboxLifecycle = <A>(
         // "dubious ownership".
         yield* execOkWithGitTimeout(
           sandbox,
-          `git config --global --add safe.directory "${sandboxRepoDir}"`,
+          gitConfigGlobalCommand("--add", "safe.directory", sandboxRepoDir),
         );
 
         // Propagate host git identity into the sandbox so commits are attributed
@@ -205,13 +222,13 @@ export const withSandboxLifecycle = <A>(
         if (hostGitName) {
           yield* execOkWithGitTimeout(
             sandbox,
-            `git config --global user.name "${hostGitName.replace(/"/g, '\\"')}"`,
+            gitConfigGlobalCommand("user.name", hostGitName),
           );
         }
         if (hostGitEmail) {
           yield* execOkWithGitTimeout(
             sandbox,
-            `git config --global user.email "${hostGitEmail.replace(/"/g, '\\"')}"`,
+            gitConfigGlobalCommand("user.email", hostGitEmail),
           );
         }
 

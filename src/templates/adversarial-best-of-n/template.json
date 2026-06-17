@@ -1,4 +1,4 @@
 {
   "name": "adversarial-best-of-n",
-  "description": "Best-of-N candidates per issue; a deterministic gate (not the LLM) decides which merges"
+  "description": "Best-of-N candidates per issue; a deterministic gate decides, merges locally, and closes"
 }

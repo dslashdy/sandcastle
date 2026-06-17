@@ -235,6 +235,45 @@ describe("withSandboxLifecycle (worktree mode)", () => {
     expect(hookCalls[1]!.options?.sudo).toBe(true);
   });
 
+  it("wraps global git config setup in a retry loop for shared persistent homes", async () => {
+    const { hostDir, worktreeDir } = await setupWorktree();
+    const execCalls: string[] = [];
+
+    const spySandboxLayer = Layer.succeed(Sandbox, {
+      exec: (command) => {
+        execCalls.push(command);
+        if (command === "git rev-parse --abbrev-ref HEAD") {
+          return Effect.succeed({
+            stdout: "sandcastle/test\n",
+            stderr: "",
+            exitCode: 0,
+          });
+        }
+        return Effect.succeed({ stdout: "", stderr: "", exitCode: 0 });
+      },
+      copyIn: () => Effect.succeed(undefined as never),
+      copyFileOut: () => Effect.succeed(undefined as never),
+    });
+
+    await Effect.runPromise(
+      withSandboxLifecycle(
+        {
+          hostRepoDir: hostDir,
+          sandboxRepoDir: worktreeDir,
+          branch: "sandcastle/test",
+        },
+        () => Effect.succeed("ok"),
+      ).pipe(Effect.provide(Layer.merge(spySandboxLayer, testDisplayLayer))),
+    );
+
+    const gitConfigSetup = execCalls.filter((command) =>
+      ["git", "config", "--global"].every((part) => command.includes(part)),
+    );
+    expect(gitConfigSetup.length).toBeGreaterThanOrEqual(1);
+    expect(gitConfigSetup[0]).toContain("for attempt in 1 2 3 4 5");
+    expect(gitConfigSetup[0]).toContain("sleep 0.2");
+  });
+
   it("onSandboxReady hooks run in parallel", async () => {
     const { hostDir, worktreeDir } = await setupWorktree();
 
@@ -899,8 +938,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
     const syncLog = entries.find(
       (e) =>
         e._tag === "taskLog" &&
-        (e.title === "No commits to sync out" ||
-          e.title.startsWith("Syncing")),
+        (e.title === "No commits to sync out" || e.title.startsWith("Syncing")),
     );
     expect(syncLog).toBeUndefined();
   });
@@ -1163,9 +1201,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           branch: "sandcastle/test",
           hooks: {
             sandbox: {
-              onSandboxReady: [
-                { command: "slow-install", timeoutMs: 500 },
-              ],
+              onSandboxReady: [{ command: "slow-install", timeoutMs: 500 }],
             },
           },
         },
@@ -1187,9 +1223,7 @@ describe("withSandboxLifecycle (worktree mode)", () => {
           branch: "sandcastle/test",
           hooks: {
             host: {
-              onSandboxReady: [
-                { command: "sleep 2", timeoutMs: 500 },
-              ],
+              onSandboxReady: [{ command: "sleep 2", timeoutMs: 500 }],
             },
           },
         },
@@ -1305,10 +1339,7 @@ describe("runHostHooks", () => {
     // sleep 2 with a 500ms timeout should fail
     await expect(
       Effect.runPromise(
-        runHostHooks(
-          [{ command: "sleep 2", timeoutMs: 500 }],
-          dir,
-        ),
+        runHostHooks([{ command: "sleep 2", timeoutMs: 500 }], dir),
       ),
     ).rejects.toThrow(/timed out/);
   });

@@ -9,6 +9,88 @@ logs/
 worktrees/
 `;
 
+const DOCKER_LOGIN_HELPER = `import { spawnSync } from "node:child_process";
+import {
+  defaultImageName,
+  defaultPersistentHomeVolumeName,
+} from "@ai-hero/sandcastle/sandboxes/docker";
+
+const imageName = process.env.SANDCASTLE_IMAGE ?? defaultImageName(process.cwd());
+const volumeName =
+  process.env.SANDCASTLE_AGENT_HOME_VOLUME ??
+  defaultPersistentHomeVolumeName(imageName);
+
+const uid = process.getuid?.() ?? 1000;
+const gid = process.getgid?.() ?? 1000;
+
+const commands = {
+  claude: ["claude", "login"],
+  codex: ["codex", "login", "--device-auth"],
+} as const;
+
+const requested = process.argv.slice(2);
+const targets =
+  requested.length > 0
+    ? requested
+    : (Object.keys(commands) as Array<keyof typeof commands>);
+
+for (const target of targets) {
+  if (!(target in commands)) {
+    console.error(
+      \`Unknown login target "\${target}". Use "claude", "codex", or no arg for both.\`,
+    );
+    process.exitCode = 1;
+    continue;
+  }
+
+  const [entrypoint, ...args] = commands[target as keyof typeof commands];
+  console.log(\`\\n=== \${target} login for \${imageName} ===\\n\`);
+
+  const result = spawnSync(
+    "docker",
+    [
+      "run",
+      "--rm",
+      process.stdin.isTTY ? "-it" : "-i",
+      "--user",
+      \`\${uid}:\${gid}\`,
+      "-e",
+      "HOME=/home/agent",
+      "-v",
+      \`\${volumeName}:/home/agent\`,
+      "-w",
+      "/home/agent",
+      "--entrypoint",
+      entrypoint,
+      imageName,
+      ...args,
+    ],
+    { stdio: "inherit" },
+  );
+
+  if (result.error) {
+    console.error(result.error.message);
+    process.exitCode = 1;
+    break;
+  }
+
+  if (result.status !== 0) {
+    process.exitCode = result.status ?? 1;
+    break;
+  }
+}
+`;
+
+const UID_GID_ALIGNMENT_BLOCK = `# Rename the base image's "node" user to "agent" and align UID/GID.
+# macOS commonly uses GID 20, which already exists in Debian images. If the
+# requested GID exists, reuse it instead of trying to groupmod "node" into a
+# duplicate GID.
+RUN if getent group "$AGENT_GID" >/dev/null; then \\
+      usermod -u "$AGENT_UID" -g "$AGENT_GID" -d /home/agent -m -l agent node; \\
+    else \\
+      groupmod -g "$AGENT_GID" node && usermod -u "$AGENT_UID" -g "$AGENT_GID" -d /home/agent -m -l agent node; \\
+    fi`;
+
 export interface TemplateMetadata {
   name: string;
   description: string;
@@ -41,7 +123,7 @@ const TEMPLATES: TemplateMetadata[] = [
   {
     name: "adversarial-best-of-n",
     description:
-      "Best-of-N candidates per issue; a deterministic gate (not the LLM) decides which merges",
+      "Best-of-N candidates per issue; a deterministic gate decides, merges locally, and closes",
   },
 ];
 
@@ -78,8 +160,11 @@ RUN apt-get update && apt-get install -y \\
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
-# Rename the base image's "node" user to "agent" and align UID/GID.
-RUN groupmod -g $AGENT_GID node && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+${UID_GID_ALIGNMENT_BLOCK}
+
+# Install Codex CLI so project-local login can be initialized from this image.
+RUN npm install -g @openai/codex
+
 USER \${AGENT_UID}:\${AGENT_GID}
 
 # Install Claude Code CLI
@@ -113,13 +198,20 @@ RUN apt-get update && apt-get install -y \\
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
-# Rename the base image's "node" user to "agent" and align UID/GID.
-RUN groupmod -g $AGENT_GID node && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+${UID_GID_ALIGNMENT_BLOCK}
 
 # Install pi coding agent (run as root before USER agent)
 RUN npm install -g @mariozechner/pi-coding-agent
 
+# Install Codex CLI so project-local login can be initialized from this image.
+RUN npm install -g @openai/codex
+
 USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Claude Code CLI so project-local login can be initialized from this image.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENV PATH="/home/agent/.local/bin:$PATH"
 
 WORKDIR /home/agent
 
@@ -146,13 +238,17 @@ RUN apt-get update && apt-get install -y \\
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
-# Rename the base image's "node" user to "agent" and align UID/GID.
-RUN groupmod -g $AGENT_GID node && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+${UID_GID_ALIGNMENT_BLOCK}
 
 # Install Codex CLI (run as root before USER agent)
 RUN npm install -g @openai/codex
 
 USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Claude Code CLI so project-local login can be initialized from this image.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENV PATH="/home/agent/.local/bin:$PATH"
 
 WORKDIR /home/agent
 
@@ -179,13 +275,20 @@ RUN apt-get update && apt-get install -y \\
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 
-# Rename the base image's "node" user to "agent" and align UID/GID.
-RUN groupmod -g $AGENT_GID node && usermod -u $AGENT_UID -g $AGENT_GID -d /home/agent -m -l agent node
+${UID_GID_ALIGNMENT_BLOCK}
 
 # Install OpenCode CLI (run as root before USER agent)
 RUN npm install -g opencode-ai@latest
 
+# Install Codex CLI so project-local login can be initialized from this image.
+RUN npm install -g @openai/codex
+
 USER \${AGENT_UID}:\${AGENT_GID}
+
+# Install Claude Code CLI so project-local login can be initialized from this image.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+ENV PATH="/home/agent/.local/bin:$PATH"
 
 WORKDIR /home/agent
 
@@ -381,12 +484,23 @@ export const getSandboxProvider = (
 export function getNextStepsLines(
   template: string,
   mainFilename: string,
+  options?: { sandboxProvider?: SandboxProviderEntry },
 ): string[] {
+  const includeDockerLogin =
+    options?.sandboxProvider === undefined ||
+    options.sandboxProvider.name === "docker";
+  const loginStep = includeDockerLogin
+    ? [
+        "   After the Docker image is built, run `npx tsx .sandcastle/login.mts` to generate Claude and Codex login links inside this project's persistent Docker home",
+      ]
+    : [];
+
   if (template === "blank") {
     return [
       "Next steps:",
       `1. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
       "   If you want to use your Claude subscription instead of an API key, see https://github.com/mattpocock/sandcastle/issues/191",
+      ...loginStep,
       "2. Read and customize .sandcastle/prompt.md to describe what you want the agent to do",
       `3. Customize .sandcastle/${mainFilename} — it uses the JS API (\`run()\`) to control how the agent runs`,
       `4. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
@@ -397,9 +511,10 @@ export function getNextStepsLines(
       "Next steps:",
       `1. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
       "   If you want to use your Claude subscription instead of an API key, see https://github.com/mattpocock/sandcastle/issues/191",
-      `2. Wire the two TODO seams in .sandcastle/${mainFilename}: \`fetchIssues()\` (against the Linear API — add LINEAR_API_KEY to .sandcastle/.env) and \`complexityReport()\` (parse a cognitive-complexity tool — complexipy is preinstalled in the image; use lizard for C++)`,
+      ...loginStep,
+      `2. Review the deterministic gate in .sandcastle/${mainFilename}, including \`complexityReport()\` and the Python tool commands, so the thresholds match your project`,
       `3. Build the sandbox image (e.g. \`sandcastle docker build-image\`) — the Dockerfile bundles the Python gate toolchain (ruff, mypy, pytest, hypothesis, complexipy). The deterministic gate runs these inside a per-issue container, so you do NOT install them on the host`,
-      `4. Review the pinned model lineup and config (N, COMPLEXITY_CEILING, NESTING_MAX) in .sandcastle/${mainFilename} — the lineup is intentionally multi-model; keep it diverse`,
+      `4. Review the issue-list command, pinned model lineup, and config (N, COMPLEXITY_CEILING, NESTING_MAX) in .sandcastle/${mainFilename} — the lineup is intentionally multi-model; keep it diverse`,
       `5. Set SANDCASTLE_CONTAINER_CLI (docker/podman) and SANDCASTLE_IMAGE if your runtime or image name differs from the defaults`,
       `6. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
       "7. Run `npm run sandcastle` to start the orchestrator",
@@ -411,6 +526,7 @@ export function getNextStepsLines(
       "Next steps:",
       `${step++}. Set the required env vars in .sandcastle/.env (see .sandcastle/.env.example)`,
       "   If you want to use your Claude subscription instead of an API key, see https://github.com/mattpocock/sandcastle/issues/191",
+      ...loginStep,
       `${step++}. Add "sandcastle": "npx tsx .sandcastle/${mainFilename}" to your package.json scripts`,
       `${step++}. Templates use \`copyToWorktree: ["node_modules"]\` to copy your host node_modules into the sandbox for fast startup — the \`npm install\` in the onSandboxReady hook is a safety net for platform-specific binaries. Adjust both if you use a different package manager`,
       `${step++}. Read and customize the prompt files in .sandcastle/ — they shape what the agent does`,
@@ -539,7 +655,7 @@ const rewriteMainTs = (
 
 /**
  * When the user opted out of the Sandcastle label, strip ` --label Sandcastle`
- * from all `.md` files in the scaffolded config directory so that `gh issue list`
+ * from text files in the scaffolded config directory so that `gh issue list`
  * commands work without a label filter.
  */
 const rewritePromptFiles = (
@@ -550,9 +666,9 @@ const rewritePromptFiles = (
     const files = yield* fs
       .readDirectory(configDir)
       .pipe(Effect.mapError((e) => new Error(e.message)));
-    const mdFiles = files.filter((f) => f.endsWith(".md"));
+    const textFiles = files.filter(isTextFile);
     yield* Effect.all(
-      mdFiles.map((f) =>
+      textFiles.map((f) =>
         Effect.gen(function* () {
           const filePath = join(configDir, f);
           const content = yield* fs
@@ -573,7 +689,10 @@ const rewritePromptFiles = (
 /** Text file extensions eligible for `{{KEY}}` template argument substitution. */
 const TEXT_FILE_EXTENSIONS = new Set([
   ".md",
+  ".mjs",
+  ".mts",
   ".txt",
+  ".ts",
   ".env",
   ".example",
   // Dockerfile / Containerfile have no extension — handled by name check below
@@ -668,6 +787,42 @@ const substituteTemplateTools = (
     );
   });
 
+const rewriteDockerPersistentHome = (
+  configDir: string,
+  mainFilename: string,
+  sandboxProvider: SandboxProviderEntry,
+): Effect.Effect<void, Error, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    if (sandboxProvider.name !== "docker") return;
+
+    const fs = yield* FileSystem.FileSystem;
+    const mainTsPath = join(configDir, mainFilename);
+    const exists = yield* fs
+      .exists(mainTsPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    if (!exists) return;
+
+    const content = yield* fs
+      .readFileString(mainTsPath)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+    const updated = content.replace(
+      /\bdocker\(\)/g,
+      "docker({ persistentHome: true })",
+    );
+    if (updated === content) return;
+
+    yield* fs
+      .writeFileString(mainTsPath, updated)
+      .pipe(Effect.mapError((e) => new Error(e.message)));
+  });
+
+const formatEnvFile = (values: Record<string, string>): string => {
+  const lines = Object.entries(values)
+    .filter(([, value]) => value.length > 0)
+    .map(([key, value]) => `${key}=${value}`);
+  return lines.length > 0 ? lines.join("\n") + "\n" : "";
+};
+
 // ---------------------------------------------------------------------------
 // Main scaffold function
 // ---------------------------------------------------------------------------
@@ -679,6 +834,7 @@ export interface ScaffoldOptions {
   createLabel?: boolean;
   backlogManager?: BacklogManagerEntry;
   sandboxProvider?: SandboxProviderEntry;
+  envValues?: Record<string, string>;
 }
 
 export interface ScaffoldResult {
@@ -722,6 +878,7 @@ export const scaffold = (
       createLabel = true,
       backlogManager = BACKLOG_MANAGER_REGISTRY[0]!, // default: github-issues
       sandboxProvider = SANDBOX_PROVIDER_REGISTRY[0]!, // default: docker
+      envValues = {},
     } = options;
     const fs = yield* FileSystem.FileSystem;
     const configDir = join(repoDir, ".sandcastle");
@@ -751,28 +908,54 @@ export const scaffold = (
       envExampleParts.push(backlogManager.envExample);
     }
     const envExampleContent = envExampleParts.join("\n") + "\n";
+    const envContent = formatEnvFile(envValues);
 
-    yield* Effect.all(
-      [
+    const scaffoldWrites: Array<
+      Effect.Effect<void, Error, FileSystem.FileSystem>
+    > = [
+      fs
+        .writeFileString(
+          join(configDir, sandboxProvider.containerfileName),
+          agent.dockerfileTemplate,
+        )
+        .pipe(Effect.mapError((e) => new Error(e.message))),
+      fs
+        .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
+        .pipe(Effect.mapError((e) => new Error(e.message))),
+      fs
+        .writeFileString(join(configDir, ".env.example"), envExampleContent)
+        .pipe(Effect.mapError((e) => new Error(e.message))),
+      copyTemplateFiles(templateDir, configDir, mainFilename),
+    ];
+
+    if (sandboxProvider.name === "docker") {
+      scaffoldWrites.push(
         fs
-          .writeFileString(
-            join(configDir, sandboxProvider.containerfileName),
-            agent.dockerfileTemplate,
-          )
+          .writeFileString(join(configDir, "login.mts"), DOCKER_LOGIN_HELPER)
           .pipe(Effect.mapError((e) => new Error(e.message))),
+      );
+    }
+
+    if (envContent) {
+      scaffoldWrites.push(
         fs
-          .writeFileString(join(configDir, ".gitignore"), GITIGNORE)
+          .writeFileString(join(configDir, ".env"), envContent)
           .pipe(Effect.mapError((e) => new Error(e.message))),
-        fs
-          .writeFileString(join(configDir, ".env.example"), envExampleContent)
-          .pipe(Effect.mapError((e) => new Error(e.message))),
-        copyTemplateFiles(templateDir, configDir, mainFilename),
-      ],
-      { concurrency: "unbounded" },
-    );
+      );
+    }
+
+    yield* Effect.all(scaffoldWrites, { concurrency: "unbounded" });
 
     // Rewrite main file with the selected agent factory and model
     yield* rewriteMainTs(configDir, agent, model, mainFilename);
+
+    // Docker scaffolds use a named `/home/agent` volume so CLI auth written
+    // during login survives Sandcastle's container teardown.
+    yield* rewriteDockerPersistentHome(
+      configDir,
+      mainFilename,
+      sandboxProvider,
+    );
 
     // Replace backlog manager template arguments in all text files (must run before label stripping)
     yield* substituteTemplateArgs(configDir, backlogManager);

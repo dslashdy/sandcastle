@@ -258,6 +258,71 @@ describe("InitService scaffold", () => {
     expect(dockerfile).not.toContain("pnpm");
   });
 
+  it("Docker scaffold writes a login helper for project-local Claude and Codex auth", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir);
+
+    const login = await readFile(
+      join(dir, ".sandcastle", "login.mts"),
+      "utf-8",
+    );
+    expect(login).toContain("defaultPersistentHomeVolumeName");
+    expect(login).toContain('claude: ["claude", "login"]');
+    expect(login).toContain('codex: ["codex", "login", "--device-auth"]');
+  });
+
+  it("Docker scaffold rewrites template docker() calls to persistentHome", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, { templateName: "parallel-planner" });
+
+    const mainTs = await readFile(
+      join(dir, ".sandcastle", "main.mts"),
+      "utf-8",
+    );
+    expect(mainTs).toContain("docker({ persistentHome: true })");
+    expect(mainTs).not.toContain("sandbox: docker(),");
+  });
+
+  it("writes .sandcastle/.env when envValues are provided", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir, { envValues: { GH_TOKEN: "ghp_test" } });
+
+    const env = await readFile(join(dir, ".sandcastle", ".env"), "utf-8");
+    expect(env).toBe("GH_TOKEN=ghp_test\n");
+  });
+
+  it("does not write .sandcastle/.env when envValues are omitted", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir);
+
+    const { access } = await import("node:fs/promises");
+    await expect(access(join(dir, ".sandcastle", ".env"))).rejects.toThrow();
+  });
+
+  it("generated Claude Dockerfile includes both Claude and Codex login CLIs", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir);
+
+    const dockerfile = await readFile(
+      join(dir, ".sandcastle", "Dockerfile"),
+      "utf-8",
+    );
+    expect(dockerfile).toContain("claude.ai/install.sh");
+    expect(dockerfile).toContain("@openai/codex");
+  });
+
+  it("generated Dockerfile tolerates macOS host GID collisions", async () => {
+    const dir = await makeDir();
+    await runScaffold(dir);
+
+    const dockerfile = await readFile(
+      join(dir, ".sandcastle", "Dockerfile"),
+      "utf-8",
+    );
+    expect(dockerfile).toContain('getent group "$AGENT_GID"');
+    expect(dockerfile).toContain('usermod -u "$AGENT_UID" -g "$AGENT_GID"');
+  });
+
   it("skeleton prompt contains section headers and hints", async () => {
     const dir = await makeDir();
     await runScaffold(dir);
@@ -608,8 +673,9 @@ describe("InitService scaffold", () => {
         "utf-8",
       );
       expect(mainTs).toContain("claude-opus-4-8");
-      expect(mainTs).toContain("claude-sonnet-4-8");
+      expect(mainTs).toContain('const CRITIC_MODEL = "claude-opus-4-8"');
       expect(mainTs).toContain("gpt-5.5");
+      expect(mainTs).toContain("generator model:");
     });
 
     it("every node runs a single iteration (no maxIterations loop)", async () => {
@@ -636,17 +702,44 @@ describe("InitService scaffold", () => {
       expect(mainTs).not.toContain("merge-to-head");
     });
 
-    it("marks the two TODO seams (fetchIssues + complexity tool)", async () => {
+    it("wires fetchIssues to the selected backlog manager and includes the complexity report gate", async () => {
       const dir = await makeDir();
-      await runScaffold(dir, { templateName: "adversarial-best-of-n" });
+      await runScaffold(dir, {
+        templateName: "adversarial-best-of-n",
+        backlogManager: getBacklogManager("github-issues"),
+      });
 
       const mainTs = await readFile(
         join(dir, ".sandcastle", "main.mts"),
         "utf-8",
       );
-      expect(mainTs).toContain("TODO");
       expect(mainTs).toContain("fetchIssues");
+      expect(mainTs).toContain("gh issue list");
+      expect(mainTs).toContain("--label Sandcastle");
+      expect(mainTs).not.toContain("Linear");
+      expect(mainTs).not.toContain("{{LIST_TASKS_COMMAND}}");
       expect(mainTs).toContain("complexityReport");
+      expect(mainTs).toContain("complexipy --output-format json");
+    });
+
+    it("merges the issue branch into the launch branch and closes the selected backlog item", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        templateName: "adversarial-best-of-n",
+        backlogManager: getBacklogManager("github-issues"),
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("mergeIntoLaunchBranch");
+      expect(mainTs).toContain("commitsAhead");
+      expect(mainTs).toContain("merged existing ${target} and closed issue");
+      expect(mainTs).toContain('git(["merge", "--no-edit", sourceBranch])');
+      expect(mainTs).toContain("closeIssue");
+      expect(mainTs).toContain("gh issue close");
+      expect(mainTs).not.toContain("{{CLOSE_TASK_COMMAND}}");
     });
 
     it("generate.md passes the issue body but not the ranking metrics", async () => {
@@ -676,12 +769,27 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("may not approve");
     });
 
-    it("getNextStepsLines points at the Linear and complexity-tool seams", () => {
+    it("getNextStepsLines points at the complexity gate for project review", () => {
       const lines = getNextStepsLines("adversarial-best-of-n", "main.ts");
       const joined = lines.join("\n");
-      expect(joined).toContain("fetchIssues");
-      expect(joined).toContain("Linear");
+      expect(joined).not.toContain("Linear");
       expect(joined).toContain("complexity");
+    });
+
+    it("strips the GitHub label filter from adversarial main.mts when createLabel is false", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        templateName: "adversarial-best-of-n",
+        backlogManager: getBacklogManager("github-issues"),
+        createLabel: false,
+      });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("gh issue list");
+      expect(mainTs).not.toContain("--label Sandcastle");
     });
 
     it("Dockerfile bundles the Python gate toolchain", async () => {

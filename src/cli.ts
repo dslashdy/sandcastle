@@ -247,7 +247,23 @@ const initCommand = Command.make(
 
       // Offer to create the "Sandcastle" label on the repo (skip for non-GitHub backlog managers)
       let shouldCreateLabel: boolean | symbol = false;
+      const envValues: Record<string, string> = {};
       if (selectedBacklogManager.name === "github-issues") {
+        const ghToken = yield* Effect.promise(() =>
+          clack.password({
+            message:
+              "GitHub PAT for sandboxed gh commands? Saved to .sandcastle/.env as GH_TOKEN. Press Enter to skip.",
+          }),
+        );
+        if (clack.isCancel(ghToken)) {
+          yield* Effect.fail(
+            new InitError({ message: "GitHub token prompt cancelled." }),
+          );
+        }
+        if (typeof ghToken === "string" && ghToken.trim()) {
+          envValues.GH_TOKEN = ghToken.trim();
+        }
+
         shouldCreateLabel = yield* Effect.promise(() =>
           clack.confirm({
             message:
@@ -261,7 +277,13 @@ const initCommand = Command.make(
             try: () =>
               execSync(
                 'gh label create "Sandcastle" --description "Issues for Sandcastle to work on" --color "F9A825" 2>/dev/null',
-                { cwd, stdio: "ignore" },
+                {
+                  cwd,
+                  stdio: "ignore",
+                  env: envValues.GH_TOKEN
+                    ? { ...process.env, GH_TOKEN: envValues.GH_TOKEN }
+                    : process.env,
+                },
               ),
             catch: () => undefined,
           }).pipe(Effect.ignore);
@@ -277,6 +299,7 @@ const initCommand = Command.make(
           createLabel: shouldCreateLabel === true,
           backlogManager: selectedBacklogManager,
           sandboxProvider: selectedSandboxProvider,
+          envValues,
         }).pipe(
           Effect.mapError(
             (e) =>
@@ -323,6 +346,7 @@ const initCommand = Command.make(
       const nextSteps = getNextStepsLines(
         selectedTemplate,
         scaffoldResult.mainFilename,
+        { sandboxProvider: selectedSandboxProvider },
       );
       for (const [i, line] of nextSteps.entries()) {
         yield* d.text(i === 0 ? line : styleText("dim", line));
